@@ -571,7 +571,8 @@ from quality import (
     render_badges_left,
 )
 from ratings import calculate_weighted_score, draw_score_bar, fetch_rating, draw_score_bar_vertical, _draw_solid_pip, draw_frosted_bar, _score_color, _score_color_alt, _score_color_metal
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION
+from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo
+import tvdb
 
 # ---------------------------------------------------------------------------
 # Persistent HTTP client
@@ -2321,6 +2322,12 @@ async def lifespan(app: FastAPI):
                 logger.warning(f"PP-OCR warm-up failed: {exc}")
         asyncio.create_task(_warm_text_detector())
 
+    try:
+        from tvdb import tvdb_status
+        logger.info(f"TVDB fallback art source: {tvdb_status()}")
+    except Exception as exc:
+        logger.warning(f"TVDB status check failed: {exc}")
+
     _digital_release_ready = asyncio.Event()
     prune_task   = asyncio.create_task(_cache_prune_loop())
     digital_task = asyncio.create_task(digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready))
@@ -3182,6 +3189,9 @@ async def get_poster(
         genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
             await _coalesced_fetch_poster_metadata(client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language)
         )
+        # Canonical IMDb id for downstream lookups (e.g. TVDB remoteid resolution):
+        # the request param if supplied, else the one TMDB returned in external_ids.
+        effective_imdb_id = (imdb_id or "").strip() or tmdb_data.get("imdb_id") or None
         _text_titles = tuple(dict.fromkeys(
             value for value in (title, tmdb_data.get("original_title")) if value
         ))
@@ -3280,6 +3290,28 @@ async def get_poster(
         _detection_deferred = False
         _vc = tmdb_data.get("vote_count")
         _vote_detection_ok = _detection_vote_ok(_vc)
+
+        async def _tvdb_is_clean(cand_image, art_id, *, source="backdrop", kind="bd") -> bool:
+            """Inline burned-in-text vet for a TVDB candidate (background or poster),
+            mirroring the TMDB text-backdrop rescue.  Returns True only when detection
+            is available, vote-gated, and reports no text.  Memoised per (tvdb id,
+            kind, crop, detector)."""
+            if not (_cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok):
+                return False
+            try:
+                from text_detect import DETECT_RES_SIG
+                _src = f"tvdb_{kind}:{art_id}:{_CROP_VERSION}:ta"
+                _key = f"{_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+                _res = get_cached_text_detection(_key)
+                if _res is None:
+                    _res = await asyncio.shield(_start_text_detection(
+                        _key, cand_image, title=_text_titles, source=source,
+                        tmdb_id=tmdb_id, vote_count=_vc, source_key=_src))
+                return _res is False
+            except Exception as exc:
+                logger.warning(f"TVDB {kind} vet failed for {tmdb_id}: {exc}")
+                return False
+
         is_no_poster = poster_path is None and not _use_backdrop
         if _use_backdrop:
             # Text-aware backdrop cropping also invokes PP-OCR, so apply the
@@ -3290,11 +3322,52 @@ async def get_poster(
             _image_coro = fetch_backdrop_image(
                 client, tmdb_id, backdrop_path, avoid_text=_backdrop_avoid_text)
         elif is_no_poster:
-            # Prefer the atmospheric genre background (minimal or photoreal set,
-            # per the request); fall back to the flat genre-tinted gradient if no
-            # background art exists for this genre in either set.
-            _bg = _load_genre_background(_tmdb_genre, rcfg.fallback_bg_style)
-            _image_coro = _resolved(_bg if _bg is not None else _make_fallback_canvas(genre_ids))
+            # No poster art at all.  Before settling for the genre canvas, try a
+            # TVDB background (curated fanart — usually textless).  Strictly an
+            # upgrade over a flat canvas.  Vet for burned-in text where possible;
+            # composite our logo only on a clean one, otherwise show it as-is.
+            _tvdb_bg = None
+            _tvdb_bg_id = None
+            if _cfg.TVDB_USE_BACKDROPS and tvdb.tvdb_enabled():
+                _bd_avoid = _cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok
+                _tvdb_bg, _tvdb_bg_id = await tvdb.tvdb_backdrop(
+                    client, media_type=type, imdb_id=effective_imdb_id,
+                    tmdb_id=tmdb_id, avoid_text=_bd_avoid,
+                )
+            # Opt-in TVDB poster as a further no-art rescue (TVDB_USE_POSTERS).
+            # A real poster — even one carrying its own title — beats a genre
+            # canvas; we composite our logo only when it vets clean.
+            _tvdb_ps = None
+            _tvdb_ps_id = None
+            if (_tvdb_bg is None and _cfg.TVDB_USE_POSTERS and tvdb.tvdb_enabled()):
+                _tvdb_ps, _tvdb_ps_id = await tvdb.tvdb_poster(
+                    client, media_type=type, language=rcfg.logo_language,
+                    imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                )
+            if _tvdb_bg is not None:
+                if await _tvdb_is_clean(_tvdb_bg, _tvdb_bg_id):
+                    is_textless = True           # clean art → composite our logo
+                    logger.info(f"TVDB background for {tmdb_id} clean — using with logo")
+                else:
+                    logger.info(f"TVDB background for {tmdb_id} unvetted/texted — using as-is")
+                is_no_poster = False
+                _backdrop_rescued = True          # pre-vetted → skip the scan block
+                _image_coro = _resolved(_tvdb_bg)
+            elif _tvdb_ps is not None:
+                if await _tvdb_is_clean(_tvdb_ps, _tvdb_ps_id, source="poster", kind="ps"):
+                    is_textless = True
+                    logger.info(f"TVDB poster for {tmdb_id} clean — using with logo")
+                else:
+                    logger.info(f"TVDB poster for {tmdb_id} unvetted/texted — using as-is")
+                is_no_poster = False
+                _backdrop_rescued = True
+                _image_coro = _resolved(_tvdb_ps)
+            else:
+                # Prefer the atmospheric genre background (minimal or photoreal set,
+                # per the request); fall back to the flat genre-tinted gradient if no
+                # background art exists for this genre in either set.
+                _bg = _load_genre_background(_tmdb_genre, rcfg.fallback_bg_style)
+                _image_coro = _resolved(_bg if _bg is not None else _make_fallback_canvas(genre_ids))
         else:
             # Option A: the title has only text-bearing art (no textless poster
             # or backdrop).  Before settling for the busy official poster, try a
@@ -3335,7 +3408,45 @@ async def get_poster(
                 _backdrop_rescued = True
                 _image_coro = _resolved(_rescued)
             else:
-                _image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
+                # Second rescue tier: a TVDB background, vetted the same way.  Only
+                # for text-bearing posters (not a clean TMDB textless one), gated to
+                # low-vote titles like the TMDB rescue above.  Falls through to the
+                # official poster when TVDB has nothing clean.
+                _tvdb_bg = None
+                _tvdb_bg_id = None
+                if (_cfg.TVDB_USE_BACKDROPS and tvdb.tvdb_enabled()
+                        and not is_textless and not _use_original_art
+                        and _detection_vote_ok(_vc)):
+                    _tvdb_bg, _tvdb_bg_id = await tvdb.tvdb_backdrop(
+                        client, media_type=type, imdb_id=effective_imdb_id,
+                        tmdb_id=tmdb_id, avoid_text=True,
+                    )
+                # Third rescue tier (opt-in, TVDB_USE_POSTERS): a TVDB poster.
+                # These usually have title text baked in, so it's only used when
+                # text detection confirms it's clean — otherwise we keep the
+                # official poster.  Same low-vote gate.
+                _tvdb_ps = None
+                _tvdb_ps_id = None
+                if (_tvdb_bg is None and _cfg.TVDB_USE_POSTERS and tvdb.tvdb_enabled()
+                        and not is_textless and not _use_original_art
+                        and _detection_vote_ok(_vc)):
+                    _tvdb_ps, _tvdb_ps_id = await tvdb.tvdb_poster(
+                        client, media_type=type, language=rcfg.logo_language,
+                        imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                    )
+                if _tvdb_bg is not None and await _tvdb_is_clean(_tvdb_bg, _tvdb_bg_id):
+                    is_textless = True
+                    _backdrop_rescued = True
+                    _image_coro = _resolved(_tvdb_bg)
+                    logger.info(f"TVDB background rescue clean for {tmdb_id} — using with logo")
+                elif _tvdb_ps is not None and await _tvdb_is_clean(
+                        _tvdb_ps, _tvdb_ps_id, source="poster", kind="ps"):
+                    is_textless = True
+                    _backdrop_rescued = True
+                    _image_coro = _resolved(_tvdb_ps)
+                    logger.info(f"TVDB poster rescue clean for {tmdb_id} — using with logo")
+                else:
+                    _image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
 
         # Start eligible foreground OCR as soon as the image arrives. Higher-vote
         # assets are recorded as deferred work instead: the request keeps waiting
@@ -3413,6 +3524,40 @@ async def get_poster(
 
                 _image_coro = _fetch_image_and_schedule_detection()
 
+        # Logo resolution across TMDB, the Metahub CDN, and (optionally) TVDB.
+        # TVDB's position in the chain is set by TVDB_LOGO_PRIORITY:
+        #   1 = TVDB first, 2 = after TMDB but before Metahub, 3 = last resort.
+        # Priority 3 (default) and a missing TVDB key both reduce to the original
+        # TMDB -> Metahub -> (TVDB) behaviour, so existing output is unchanged.
+        _tvdb_logo_pri = _cfg.TVDB_LOGO_PRIORITY if tvdb.tvdb_enabled() else 3
+
+        async def _resolve_logo():
+            async def _tmdb(use_metahub):
+                return await fetch_logo(
+                    client, logos, rcfg.logo_language,
+                    imdb_id=effective_imdb_id,
+                    original_language=tmdb_data.get("original_language"),
+                    logo_priority=rcfg.logo_priority,
+                    use_metahub=use_metahub,
+                )
+
+            async def _tvdb():
+                return await tvdb.tvdb_logo(
+                    client, media_type=type, logo_language=rcfg.logo_language,
+                    imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                )
+
+            async def _metahub():
+                return (await _fetch_metahub_logo(client, effective_imdb_id)
+                        if effective_imdb_id else None)
+
+            if _tvdb_logo_pri == 1:
+                return (await _tvdb()) or (await _tmdb(use_metahub=True))
+            if _tvdb_logo_pri == 2:
+                return (await _tmdb(use_metahub=False)) or (await _tvdb()) or (await _metahub())
+            # priority 3 — TMDB -> Metahub -> TVDB
+            return (await _tmdb(use_metahub=True)) or (await _tvdb())
+
         (
             image,
             logo,
@@ -3420,7 +3565,7 @@ async def get_poster(
             trending_rank,
         ) = await asyncio.gather(
             _image_coro,
-            fetch_logo(client, logos, rcfg.logo_language, imdb_id=imdb_id, original_language=tmdb_data.get("original_language"), logo_priority=rcfg.logo_priority) if (is_textless and not is_no_poster) else _resolved(None),
+            _resolve_logo() if (is_textless and not is_no_poster) else _resolved(None),
             rating_coro,
             fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
         )
