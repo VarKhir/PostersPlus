@@ -390,9 +390,13 @@ async def fetch_poster_metadata(
     #   null  — language-neutral entries (TMDB's signal for textless/unspecified)
     #   en    — English (logos + fallback posters)
     #   logo_language — non-English logo candidates when requested
+    # For regional locales (fr-fr), TMDB image rows are still language-tagged
+    # with iso_639_1=fr and iso_3166_1=FR, so the API request must include the
+    # base language too. The later selector remains strict and rejects fr-CA for
+    # a fr-fr request.
     # Note: null-language ≠ guaranteed text-free; TMDB uses it for both truly
     # textless art and posters where the language simply wasn't catalogued.
-    _img_langs = "en,null" if logo_language == "en" else f"{logo_language},en,null"
+    _img_langs = ",".join(_tmdb_include_image_languages(logo_language))
 
     logger.info(f"External API Call: Requested meta from TMDB for {tmdb_id}")
     resp = await client.get(
@@ -530,19 +534,17 @@ async def fetch_poster_metadata(
             logger.warning(f"Supplemental image fetch failed for {tmdb_id}: {exc}")
 
     # Original-art mode picks a TEXTUAL poster by language at RENDER time (so it
-    # honours the request's native language, not the fetch-time one).  Store the
-    # best language-tagged poster per language here — keyed iso_639_1 → file_path,
-    # excluding null/"" (textless).  (Computed after the supplemental fetch.)
+    # honours the request's native language, not the fetch-time one). Store the
+    # best language-tagged poster per locale key (e.g. fr-fr) and base language
+    # (e.g. fr), excluding null/"" textless entries.
     poster_langs: dict[str, str] = {}
     _poster_best_vote: dict[str, float] = {}
     for _p in posters:
-        _pl = _p.get("iso_639_1")
-        if not _pl:
-            continue
         _pv = _p.get("vote_average") or 0
-        if _pl not in poster_langs or _pv > _poster_best_vote[_pl]:
-            poster_langs[_pl] = _p["file_path"]
-            _poster_best_vote[_pl] = _pv
+        for _pl in _image_language_keys(_p):
+            if _pl not in poster_langs or _pv > _poster_best_vote[_pl]:
+                poster_langs[_pl] = _p["file_path"]
+                _poster_best_vote[_pl] = _pv
 
     set_cached_tmdb_metadata(
         metadata_cache_key,
@@ -966,6 +968,42 @@ async def _fetch_metahub_logo(
     return logo
 
 
+def _normalise_image_locale(value: str | None) -> str:
+    return (value or "").strip().lower().replace("_", "-")
+
+
+def _image_language_keys(image: dict) -> list[str]:
+    language = _normalise_image_locale(image.get("iso_639_1"))
+    if not language:
+        return []
+    region = _normalise_image_locale(image.get("iso_3166_1"))
+    keys = [f"{language}-{region}"] if region else []
+    keys.append(language)
+    return list(dict.fromkeys(keys))
+
+
+def _image_matches_language(image: dict, requested: str | None) -> bool:
+    requested = _normalise_image_locale(requested)
+    if not requested:
+        return False
+    keys = _image_language_keys(image)
+    if "-" in requested:
+        return requested in keys
+    return requested in keys
+
+
+def _tmdb_include_image_languages(logo_language: str | None) -> list[str]:
+    requested = _normalise_image_locale(logo_language) or "en"
+    languages: list[str] = []
+    if requested != "en":
+        languages.append(requested)
+        base = requested.split("-", 1)[0]
+        if base and base != requested:
+            languages.append(base)
+    languages.extend(["en", "null"])
+    return list(dict.fromkeys(languages))
+
+
 def image_language_order(
     logo_language: str,
     original_language: str | None,
@@ -1011,14 +1049,13 @@ async def fetch_logo(
         "original_native"           → original, then native
         "native_if_original_english" → native when the content is native,
                                         otherwise English, then original
-        "native_text"               → native only (skip the original-language
-                                       bucket so the caller's text-title fallback
-                                       renders the translated title instead)
+        "native_text"               → native only, then English before neutral
+                                       fallback (skip original-language logos)
 
-    After those, the common fallbacks apply regardless of priority:
-      → TMDB language-neutral logo (iso_639_1 null/"")
-      → TMDB English logo
-      → Metahub CDN logo (images.metahub.space) — requires imdb_id
+    After the priority buckets, the common fallbacks apply:
+      → TMDB English logo, Metahub, then neutral logo for native_text
+      → TMDB language-neutral logo, then English logo for other priorities
+      → Metahub CDN logo for other priorities (images.metahub.space)
       → None (caller may render the translated title as text instead).
 
     All results are cached locally so repeat requests never hit external APIs.
@@ -1030,20 +1067,33 @@ async def fetch_logo(
     _cand = [lg for lg in logos if lg["file_path"].lower().endswith(_exts)]
 
     language_buckets = {
-        language: [lg for lg in _cand if lg.get("iso_639_1") == language]
+        language: [lg for lg in _cand if _image_matches_language(lg, language)]
         for language in image_language_order(
             logo_language, original_language, logo_priority
         )
     }
     neutral   = [lg for lg in _cand if lg.get("iso_639_1") in (None, "")]
-    english   = [lg for lg in _cand if lg.get("iso_639_1") == "en"]
+    english   = [lg for lg in _cand if _image_matches_language(lg, "en")]
 
     candidates = []
     for language in language_buckets:
         if language_buckets[language]:
             candidates = language_buckets[language]
             break
-    candidates = candidates or neutral or english
+
+    if logo_priority == "native_text":
+        if not candidates and english:
+            candidates = english
+        if not candidates and use_metahub and imdb_id:
+            metahub_logo = await _fetch_metahub_logo(client, imdb_id)
+            if metahub_logo is not None:
+                return metahub_logo
+        if not candidates and neutral:
+            candidates = neutral
+    else:
+        for bucket in (neutral, english):
+            if not candidates and bucket:
+                candidates = bucket
 
     candidates = sorted(
         candidates,
