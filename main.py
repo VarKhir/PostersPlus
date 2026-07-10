@@ -9,9 +9,12 @@ import re
 import time
 import httpx
 import numpy as np
+from datetime import datetime, timedelta, timezone
+import zoneinfo
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from urllib.parse import parse_qsl, urlencode
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -475,6 +478,22 @@ def _next_mdblist_server_key(current_key: str, now: float | None = None) -> str 
     return None
 
 
+def _mdblist_server_key_number(key: str | None) -> int | None:
+    if not key:
+        return None
+    for idx, candidate in enumerate(_cfg.SERVER_MDBLIST_KEYS):
+        if candidate == key:
+            return idx + 1
+    return None
+
+
+def _mdblist_server_key_label(key: str | None) -> str:
+    number = _mdblist_server_key_number(key)
+    if number is None:
+        return "request-supplied key"
+    return f"configured key #{number}"
+
+
 def _mark_mdblist_rate_limit(
     imdb_id: str, key: str, result
 ) -> tuple[float, str | None]:
@@ -539,9 +558,10 @@ from cache import (
     get_cached_quality,
     get_cached_rating,
     get_cached_final_poster,
+    set_cached_final_poster,
+    delete_cached_final_poster,
     get_cached_tmdb_poster,
     get_cached_tmdb_metadata,
-    set_cached_final_poster,
     get_cached_text_detection,
     set_cached_text_detection,
     init_db,
@@ -552,6 +572,7 @@ from cache import (
     get_cache_stats,
     get_app_state,
     set_app_state,
+    get_db,
 )
 from digital_release import digital_release_poll_loop
 import config as _cfg
@@ -703,7 +724,7 @@ class RequestConfig:
     sash_poster_color:   bool = False   # diagonal sash colour derived from poster art
     cinema_greyscale:    bool = True    # greyscale art when release_status == "Cinema"
     cinema_greyscale_skip_if_available: bool = False  # keep colour if Web/Remux source found
-    release_status_cinema_only: bool = True   # only show release status when "Cinema"
+    release_status_cinema_only: bool = False  # only show release status when "Cinema"
     badge_display_mode:  int  = field(default_factory=lambda: _cfg.BADGE_DISPLAY_MODE)
     rating_display_mode: int  = field(default_factory=lambda: _cfg.SHOW_RATING_DISPLAY_MODE)
 
@@ -786,10 +807,16 @@ class RequestConfig:
     sash_priority: list[str] = field(default_factory=lambda: list(_cfg.SASH_PRIORITY))
     muted: bool = False
     textless: bool = False
+    top_gradient:    str = "high"   # off | low | medium | high | custom - strength of the top vignette
+    bottom_gradient: str = "high"   # off | low | medium | high | custom - strength of the bottom vignette
+    top_vignette_sash_only: bool = False
+    top_gradient_opacity: float | None = None
+    top_gradient_height: float | None = None
+    bottom_gradient_opacity: float | None = None
+    bottom_gradient_height: float | None = None
+    hide_genre: bool = False
     score_color_mode: int = 2
     score_custom_palette: CustomScorePalette | None = None
-    top_gradient:    str = "high"   # off | low | medium | high — strength of the top vignette
-    bottom_gradient: str = "high"   # off | low | medium | high — strength of the bottom vignette
     sash_badge: bool = False              # legacy; superseded by sash_mode (kept for back-compat parsing)
     sash_mode: str = "sash"               # "sash" (diagonal) | "notch"
     sash_badge_style:  str   = "frosted" # "silver" | "gold" | "frosted"
@@ -849,13 +876,26 @@ def _parse_sash_priority(raw: str | None) -> list[str]:
     # Tokens prefixed with "-" are explicit exclusions
     excluded  = {t[1:] for t in tokens if t.startswith("-") and t[1:] in ALL_PRIORITY_SLOTS}
     active    = [t      for t in tokens if not t.startswith("-") and t in ALL_PRIORITY_SLOTS]
+
+    # Back-compat: the legacy combined "structural" / "release_status" tokens
+    # expand in place to their granular slots so older saved URLs keep working.
+    if "structural" in active:
+        idx = active.index("structural")
+        expanded = [s for s in ["short_film", "mini_series", "binge_ready"] if s not in excluded and s not in active]
+        active = active[:idx] + expanded + active[idx+1:]
+        
+    if "release_status" in active:
+        idx = active.index("release_status")
+        expanded = [s for s in ["cinema", "streaming", "physical", "production", "ended", "cancelled", "airing"] if s not in excluded and s not in active]
+        active = active[:idx] + expanded + active[idx+1:]
+        
+    # An empty, exclusion-free selection means no real sash config was supplied,
+    # so fall back to the full default set. Otherwise the explicit selection is
+    # authoritative: slots the user did not list are omitted rather than
+    # force-appended, so sashes added in a newer version stay off until the user
+    # opts in (re-import the old URL, then enable the new sashes).
     if not active and not excluded:
         return list(_cfg.SASH_PRIORITY)
-    # Append any default slots that weren't explicitly listed or excluded
-    active_set = set(active)
-    for slot in _cfg.SASH_PRIORITY:
-        if slot not in active_set and slot not in excluded:
-            active.append(slot)
     return active
 
 
@@ -913,6 +953,8 @@ def build_request_config(params: dict) -> RequestConfig:
         cfg.top_gradient = "high"
     elif _tg_raw in ("false", "0", "no"):
         cfg.top_gradient = "off"
+    elif _tg_raw == "custom":
+        cfg.top_gradient = "custom"
     # else: leave RequestConfig default ("high")
 
     # bottom_gradient — same four-level enum as top.  Brand-new param so no
@@ -921,6 +963,28 @@ def build_request_config(params: dict) -> RequestConfig:
     _bg_raw = (params.get("bottom_gradient") or "").strip().lower()
     if _bg_raw in _BOTTOM_GRADIENT_LEVELS:
         cfg.bottom_gradient = _bg_raw
+    elif _bg_raw == "custom":
+        cfg.bottom_gradient = "custom"
+
+    cfg.top_vignette_sash_only = _b("top_vignette_sash_only", cfg.top_vignette_sash_only)
+    val_tgo = params.get("top_gradient_opacity")
+    if val_tgo is not None:
+        try: cfg.top_gradient_opacity = float(val_tgo)
+        except ValueError: pass
+    val_tgh = params.get("top_gradient_height")
+    if val_tgh is not None:
+        try: cfg.top_gradient_height = float(val_tgh)
+        except ValueError: pass
+    val_bgo = params.get("bottom_gradient_opacity")
+    if val_bgo is not None:
+        try: cfg.bottom_gradient_opacity = float(val_bgo)
+        except ValueError: pass
+    val_bgh = params.get("bottom_gradient_height")
+    if val_bgh is not None:
+        try: cfg.bottom_gradient_height = float(val_bgh)
+        except ValueError: pass
+    cfg.hide_genre = _b("hide_genre", cfg.hide_genre)
+
     cfg.sash_badge              = _b("sash_badge",              cfg.sash_badge)
     # sash_mode supersedes the legacy sash_badge bool; fall back to it for old
     # URLs/presets (sash_badge=true → notch, false → diagonal sash).
@@ -1324,6 +1388,28 @@ def build_poster(
     else:
         genre_label = _GENRE_LABEL_OVERRIDES.get(genre, genre)
 
+    if cfg.hide_genre:
+        genre_label = ""
+        
+    # Resolve the info-sash pick once, regardless of whether the diagonal sash
+    # itself is rendered independently.
+    #
+    # When greyscale is active on an unreleased title (Cinema / Production),
+    # force the release-status slot to the front so its badge always wins — that
+    # tells the user the poster is greyscale because it's unavailable, rather
+    # than a title whose art happens to be black & white.
+    _sash_priority = cfg.sash_priority
+    if (cfg.cinema_greyscale and discovery_meta is not None
+            and discovery_meta.release_status in ("Cinema", "Production")):
+        _status = discovery_meta.release_status.lower()
+        if _status in _sash_priority or "release_status" in _sash_priority:
+            _sash_priority = [s for s in _sash_priority if s in ("release_status", _status)] + [s for s in _sash_priority if s not in ("release_status", _status)]
+    sash_result = (
+        pick_sash(discovery_meta, _sash_priority)
+        if discovery_meta is not None
+        else None
+    )
+
     # --- TOP GRADIENT (vectorised) ---
     # Darkens the top of the poster so the age-rating numeral and quality
     # badges stay legible over bright art.  Strength is one of four presets
@@ -1331,10 +1417,15 @@ def build_poster(
     # (height_ratio, max_alpha) tuple each level uses.  Unknown level is
     # treated as "high" rather than skipped so a typo in a URL doesn't
     # silently disable the vignette.
-    _tg_preset = _TOP_GRADIENT_LEVELS.get(cfg.top_gradient, _TOP_GRADIENT_LEVELS["high"])
-    if _tg_preset is not None:
+    _tg_preset: tuple[float, int] | None
+    if cfg.top_gradient == "custom" and cfg.top_gradient_opacity is not None and cfg.top_gradient_height is not None:
+        _tg_preset = (cfg.top_gradient_height, int(cfg.top_gradient_opacity * 255 if cfg.top_gradient_opacity <= 1.0 else cfg.top_gradient_opacity))
+    else:
+        _tg_preset = _TOP_GRADIENT_LEVELS.get(cfg.top_gradient, _TOP_GRADIENT_LEVELS["high"])
+        
+    if _tg_preset is not None and (not cfg.top_vignette_sash_only or sash_result is not None):
         top_height_ratio, top_max_alpha = _tg_preset
-        top_height = int(height * top_height_ratio)
+        top_height = max(1, int(height * top_height_ratio))
         t_top = np.linspace(0, 1, top_height, dtype=np.float32)
         eased_top = ((1 - t_top) * top_max_alpha).astype(np.uint8)
         top_array = np.broadcast_to(eased_top[:, np.newaxis], (top_height, width)).copy()
@@ -1351,10 +1442,14 @@ def build_poster(
     # like the lighter fade those modes used to get for free, pick "medium".
     # Unknown level falls back to "high" so a typo can't accidentally turn
     # the fade off entirely (which would break label legibility).
-    _bg_preset = _BOTTOM_GRADIENT_LEVELS.get(cfg.bottom_gradient, _BOTTOM_GRADIENT_LEVELS["high"])
+    if cfg.bottom_gradient == "custom" and cfg.bottom_gradient_opacity is not None and cfg.bottom_gradient_height is not None:
+        _bg_preset = (cfg.bottom_gradient_height, int(cfg.bottom_gradient_opacity * 255 if cfg.bottom_gradient_opacity <= 1.0 else cfg.bottom_gradient_opacity))
+    else:
+        _bg_preset = _BOTTOM_GRADIENT_LEVELS.get(cfg.bottom_gradient, _BOTTOM_GRADIENT_LEVELS["high"])
+        
     if _bg_preset is not None:
         bottom_height_ratio, bottom_max_alpha = _bg_preset
-        bottom_height = int(height * bottom_height_ratio)
+        bottom_height = max(1, int(height * bottom_height_ratio))
         bottom_start  = height - bottom_height
         t_bot         = np.linspace(0, 1, bottom_height, dtype=np.float32)
         eased_bot     = ((1 - (1 - t_bot) ** _BOTTOM_GRADIENT_CURVE) * bottom_max_alpha).astype(np.uint8)
@@ -1494,7 +1589,7 @@ def build_poster(
 
         def _line_width(text: str, current_font) -> int:
             bbox = draw.textbbox((0, 0), text, font=current_font)
-            return bbox[2] - bbox[0]
+            return int(bbox[2] - bbox[0])
 
         def _wrap_lines(text: str, current_font) -> list[str]:
             """Greedy word-wrap: each line packs as many words as fit within max_w."""
@@ -1580,7 +1675,7 @@ def build_poster(
             if scale < 1.0:
                 text_layer = text_layer.resize(
                     (max(1, int(text_layer.width * scale)), max(1, int(text_layer.height * scale))),
-                    Image.LANCZOS,
+                    Image.Resampling.LANCZOS,
                 )
 
             logo_x = round((width - text_layer.width) / 2)
@@ -1592,23 +1687,6 @@ def build_poster(
                 logo_y = int(centre_y - text_layer.height / 2)
             image.paste(text_layer, (logo_x, logo_y), text_layer)
 
-    # Resolve the info-sash pick once, regardless of whether the diagonal sash
-    # itself is rendered independently.
-    #
-    # When greyscale is active on an unreleased title (Cinema / Production),
-    # force the release-status slot to the front so its badge always wins — that
-    # tells the user the poster is greyscale because it's unavailable, rather
-    # than a title whose art happens to be black & white.
-    _sash_priority = cfg.sash_priority
-    if (cfg.cinema_greyscale and discovery_meta is not None
-            and discovery_meta.release_status in ("Cinema", "Production")
-            and "release_status" in _sash_priority):
-        _sash_priority = ["release_status"] + [s for s in _sash_priority if s != "release_status"]
-    sash_result = (
-        pick_sash(discovery_meta, _sash_priority)
-        if discovery_meta is not None
-        else None
-    )
 
     # --- Shared frosted tint (Match Notch Colour) ---------------------------
     # When the frosted rating bar (mode 4) and a poster-coloured sash element are
@@ -1661,13 +1739,13 @@ def build_poster(
                 sash_result if (_append_sash and sash_result) else (None, None)
             )
 
-            _pre_sash = [genre_label]
+            _pre_sash = [genre_label] if genre_label else []
             if _append_year and release_year:
                 _pre_sash.append(str(release_year))
             _label_main = " · ".join(_pre_sash)
 
             if _sash_text_for_label:
-                label = _label_main + " · " + translate_sash(_sash_text_for_label, cfg.logo_language)
+                label = _label_main + " · " + translate_sash(_sash_text_for_label, cfg.logo_language) if _label_main else translate_sash(_sash_text_for_label, cfg.logo_language)
             else:
                 label = _label_main
             rating_cy = height * cfg.accent_bar_y_offset
@@ -1705,7 +1783,7 @@ def build_poster(
                 _score_text = "10" if score >= 100 else f"{score / 10:.1f}"
             else:
                 _score_text = str(score)
-            label = f"{genre_label} ★ {_score_text}"
+            label = f"{genre_label} ★ {_score_text}" if genre_label else f"★ {_score_text}"
             rating_cy = height * cfg.numeric_score_y_offset
 
             try:
@@ -1742,18 +1820,18 @@ def build_poster(
             # Mode 1 ("Rating"): genre ★ score
             # Mode 2 ("Year + Rating"): genre [pip] year ★ score
             _has_score = score not in ("N/A", None)
-            parts = [(genre_label, None)]   # (text, separator_before)
+            parts = [(genre_label, None)] if genre_label else []
             if cfg.minimalist_append_mode == 0:
                 if release_year:
-                    parts.append((str(release_year), "rpip"))
+                    parts.append((str(release_year), "rpip" if parts else None))
             elif cfg.minimalist_append_mode == 1:
                 if _has_score:
-                    parts.append((str(score), "star"))
+                    parts.append((str(score), "star" if parts else None))
             else:  # 2 — Year + Rating
                 if release_year:
-                    parts.append((str(release_year), "pip"))
+                    parts.append((str(release_year), "pip" if parts else None))
                 if _has_score:
-                    parts.append((str(score), "star"))
+                    parts.append((str(score), "star" if parts else None))
 
             pip_gap = int(font_size * 0.55)
             pip_w   = max(4, int(font_size * 0.18))
@@ -1766,7 +1844,7 @@ def build_poster(
             ops    = []   # (kind, x[, text]); kind in text|pip|rpip|star
             for i in range(len(parts) - 1, -1, -1):
                 seg, sep = parts[i]
-                seg_x = cursor - draw.textlength(seg, font=font_meta)
+                seg_x = int(cursor - draw.textlength(seg, font=font_meta))
                 ops.append(("text", seg_x, seg))
                 cursor = seg_x
                 if sep:
@@ -2167,8 +2245,8 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
 
         async def _fetch_rating_warm(_key: str):
             async with _mdblist_semaphore:
-                return await _with_retry(
-                    fetch_rating, client, imdb_id, _key, genre_ids, media_type,
+                return await fetch_rating(
+                    client, imdb_id, _key, genre_ids, media_type,
                 )
 
         result = await _fetch_rating_warm(effective_mdblist_key)
@@ -2255,6 +2333,130 @@ def _seconds_until_next_hour(target_hour: float, now: float | None = None) -> fl
     if target <= now:
         target += 86400
     return target - now
+
+# Third-party credentials must never be persisted to the poster cache. They are
+# stripped before storage; the background regeneration cycle re-supplies the
+# server-side keys. access_key is intentionally kept — the /poster replay needs
+# it to pass the instance access gate, and it is the instance's own key.
+_UNCACHEABLE_PARAMS = {"tmdb_key", "mdblist_key"}
+
+
+def _sanitize_request_params(query: str) -> str:
+    """Drop user API keys from a stored query string, preserving order."""
+    if not query:
+        return query
+    kept = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)
+            if k not in _UNCACHEABLE_PARAMS]
+    return urlencode(kept)
+
+
+async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
+    logger.info("Starting scheduled trending fetch cycle")
+    if not _cfg.SERVER_TMDB_KEY:
+        logger.info("Trending fetch: skipped - no server TMDB key configured")
+        return
+
+    try:
+        trending = await fetch_trending_candidates(
+            client, _cfg.SERVER_TMDB_KEY, max_items=max(_cfg.TRENDING_FETCH_COUNT, _cfg.TRENDING_BROAD_FETCH_COUNT)
+        )
+    except Exception as exc:
+        logger.error(f"Trending fetch: failed to fetch candidates: {exc}")
+        return
+
+    # Build the set of trending (tmdb_id, type) pairs. TV titles are cached under
+    # both "tv" and "series" (Stremio uses "series"), so include both variants.
+    # Keeping the media type prevents a movie and a TV show that share a numeric
+    # TMDB id from cross-triggering each other's regeneration.
+    trending_pairs: set[tuple[str, str]] = set()
+    for item in trending:
+        tid = item.get("tmdb_id")
+        if tid is None:
+            continue
+        tid = str(tid)
+        mt = item.get("media_type")
+        if mt in ("tv", "series"):
+            trending_pairs.add((tid, "tv"))
+            trending_pairs.add((tid, "series"))
+        elif mt:
+            trending_pairs.add((tid, mt))
+    if not trending_pairs:
+        return
+
+    db = get_db()
+    try:
+        rows = db.execute("SELECT cache_key, request_params FROM final_poster_cache WHERE request_params IS NOT NULL").fetchall()
+    except Exception as exc:
+        logger.error(f"Trending fetch: failed to query cache: {exc}")
+        return
+
+    # Use a test client to regenerate posters through the API
+    regenerated_count = 0
+    
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as local_client:
+        for cache_key, req_params_str in rows:
+            parts = cache_key.split(":")
+            if len(parts) < 4:
+                continue
+            if (parts[1], parts[2]) not in trending_pairs:
+                continue
+            if not req_params_str:
+                continue
+            logger.info(f"Trending fetch: regenerating poster for {cache_key}")
+            try:
+                # Delete first so the replay misses the cache and re-renders with
+                # the fresh trending rank instead of serving the stale composite.
+                delete_cached_final_poster(cache_key)
+                resp = await local_client.get(f"/poster?{req_params_str}")
+                if resp.status_code >= 400:
+                    logger.warning(f"Trending fetch: regenerate for {cache_key} returned HTTP {resp.status_code}")
+                else:
+                    regenerated_count += 1
+            except Exception as exc:
+                logger.error(f"Trending fetch: failed to regenerate poster {cache_key}: {exc}")
+                    
+    logger.info(f"Trending fetch cycle completed. Regenerated {regenerated_count} posters.")
+
+
+async def _trending_fetch_loop() -> None:
+    """Periodically fetch trending items and regenerate cached posters."""
+    # First run immediately on startup
+    await asyncio.sleep(10)
+    try:
+        if _HTTP_CLIENT is not None:
+            await _run_trending_fetch_cycle(_HTTP_CLIENT)
+    except Exception as exc:
+        logger.error(f"Trending fetch: startup cycle failed: {exc}")
+
+    while True:
+        if not _cfg.TRENDING_FETCH_TIME:
+            wait = 86400.0
+        else:
+            try:
+                tz = zoneinfo.ZoneInfo(_cfg.TRENDING_FETCH_TIMEZONE)
+            except Exception as exc:
+                logger.error(f"Trending fetch: invalid timezone {_cfg.TRENDING_FETCH_TIMEZONE}: {exc}, using UTC")
+                tz = zoneinfo.ZoneInfo("UTC")
+
+            try:
+                h, m = map(int, _cfg.TRENDING_FETCH_TIME.split(':'))
+            except ValueError:
+                h, m = 0, 0
+                
+            now_dt = datetime.now(tz)
+            target_dt = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+            if target_dt <= now_dt:
+                target_dt += timedelta(days=1)
+            wait = (target_dt - now_dt).total_seconds()
+            
+        logger.info(f"Trending fetch: next cycle scheduled in {wait / 3600:.1f} hours")
+        await asyncio.sleep(wait)
+        try:
+            if _HTTP_CLIENT is not None:
+                await _run_trending_fetch_cycle(_HTTP_CLIENT)
+        except Exception as exc:
+            logger.error(f"Trending fetch: cycle failed: {exc}")
 
 
 async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -> None:
@@ -2396,10 +2598,12 @@ async def lifespan(app: FastAPI):
     prune_task   = asyncio.create_task(_cache_prune_loop())
     digital_task = asyncio.create_task(digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready))
     cache_warm_task = asyncio.create_task(_cache_warm_loop(_digital_release_ready))
+    trending_task = asyncio.create_task(_trending_fetch_loop())
     yield
     prune_task.cancel()
     digital_task.cancel()
     cache_warm_task.cancel()
+    trending_task.cancel()
     if _background_detection_task is not None:
         _background_detection_task.cancel()
     # Await the cancelled tasks so their finally: blocks finish unwinding
@@ -2410,6 +2614,8 @@ async def lifespan(app: FastAPI):
         await digital_task
     with suppress(asyncio.CancelledError):
         await cache_warm_task
+    with suppress(asyncio.CancelledError):
+        await trending_task
     if _background_detection_task is not None:
         with suppress(asyncio.CancelledError):
             await _background_detection_task
@@ -2487,6 +2693,24 @@ async def remove_server_header(request: Request, call_next):
 async def server_caps(access_key: str = ""):
     if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
         raise HTTPException(status_code=403, detail="Unauthorized")
+    next_refresh_hours = None
+    if _cfg.TRENDING_FETCH_TIME:
+        import zoneinfo
+        from datetime import datetime, timedelta
+        try:
+            tz = zoneinfo.ZoneInfo(_cfg.TRENDING_FETCH_TIMEZONE)
+        except Exception:
+            tz = zoneinfo.ZoneInfo("UTC")
+        try:
+            h, m = map(int, _cfg.TRENDING_FETCH_TIME.split(':'))
+            now_dt = datetime.now(tz)
+            target_dt = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+            if target_dt <= now_dt:
+                target_dt += timedelta(days=1)
+            next_refresh_hours = round((target_dt - now_dt).total_seconds() / 3600, 1)
+        except Exception:
+            pass
+
     return {
         "tmdb_key_set":          bool(_cfg.SERVER_TMDB_KEY),
         "mdblist_key_set":       bool(_cfg.SERVER_MDBLIST_KEYS),
@@ -2496,6 +2720,10 @@ async def server_caps(access_key: str = ""):
             bool(_cfg.AIOSTREAMS_URL and _cfg.AIOSTREAMS_AUTH)
             or (_cfg.QUALITY_SOURCE == "scraper" and bool(_cfg.SCRAPER_URL))
         ),
+        "trending_fetch_count":  _cfg.TRENDING_FETCH_COUNT,
+        "trending_fetch_time":   _cfg.TRENDING_FETCH_TIME,
+        "trending_fetch_timezone": _cfg.TRENDING_FETCH_TIMEZONE,
+        "trending_next_refresh_hours": next_refresh_hours,
     }
 
 
@@ -2546,7 +2774,11 @@ def _compute_render_assets_signature() -> str:
 def _server_render_signature() -> str:
     return "|".join((
         f"render={_RENDER_CACHE_VERSION}",
+        f"format={_cfg.IMAGE_FORMAT}",
+        # Include both quality knobs so a change to either busts the render
+        # cache regardless of which format is currently active.
         f"jpeg={_cfg.JPEG_QUALITY}",
+        f"webp={_cfg.WEBP_QUALITY}",
         f"contrast={int(_cfg.LOGO_CONTRAST_RESCUE)}",
         f"stretch={int(_cfg.LOGO_STRETCH_DISABLED)}:{_cfg.LOGO_STRETCH_FACTOR:g}",
         f"assets={_render_assets_signature}",
@@ -2559,6 +2791,11 @@ def _load_configurator_html() -> str:
     try:
         with open(html_path, "r", encoding="utf-8") as f:
             content = f.read()
+
+        content = content.replace("{{TRENDING_FETCH_COUNT}}", str(_cfg.TRENDING_FETCH_COUNT))
+        content = content.replace("{{TRENDING_FETCH_COUNT_PLUS_ONE}}", str(_cfg.TRENDING_FETCH_COUNT + 1))
+        content = content.replace("{{TRENDING_BROAD_FETCH_COUNT}}", str(_cfg.TRENDING_BROAD_FETCH_COUNT))
+
         _configurator_etag = '"' + hashlib.md5(content.encode("utf-8")).hexdigest()[:16] + '"'
         return content
     except FileNotFoundError:
@@ -2641,7 +2878,7 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     cached = _debug_canvas_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _DEBUG_CANVAS_TTL:
         return Response(
-            content=cached[1], media_type="image/jpeg",
+            content=cached[1], media_type=f"image/{_cfg.IMAGE_FORMAT}",
             headers={"Cache-Control": "private, max-age=300"},
         )
     gid = _DEBUG_GENRE_IDS.get(genre)
@@ -2653,14 +2890,14 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     img = build_poster(canvas, _score, genre, cfg, fallback_title=title,
                        release_year=(year or None), no_poster=True)
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=90)
-    jpeg = buf.getvalue()
+    _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
+    img.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
+    data = buf.getvalue()
     if len(_debug_canvas_cache) >= _DEBUG_CANVAS_MAX_ENTRIES:
         oldest = min(_debug_canvas_cache, key=lambda key: _debug_canvas_cache[key][0])
         _debug_canvas_cache.pop(oldest, None)
-    _debug_canvas_cache[cache_key] = (now, jpeg)
     return Response(
-        content=jpeg, media_type="image/jpeg",
+        content=data, media_type=f"image/{_cfg.IMAGE_FORMAT}",
         headers={"Cache-Control": "private, max-age=300"},
     )
 
@@ -3020,7 +3257,7 @@ async def get_poster(
             etag = f'"{final_cache_key}"'
             if request.headers.get("if-none-match") == etag:
                 return Response(status_code=304)
-            _hit_resp = Response(content=cached_jpeg, media_type="image/jpeg")
+            _hit_resp = Response(content=cached_jpeg, media_type=f"image/{_cfg.IMAGE_FORMAT}")
             _hit_resp.headers["ETag"] = etag
             # This path is only reached when composite caching is enabled, so a
             # no-store branch would be dead here — CDN TTL is the only option.
@@ -3042,7 +3279,7 @@ async def get_poster(
         if _existing_fut is not None:
             logger.info(f"Coalescing request for {final_cache_key}")
             try:
-                _coal_resp = Response(content=await _existing_fut, media_type="image/jpeg")
+                _coal_resp = Response(content=await _existing_fut, media_type=f"image/{_cfg.IMAGE_FORMAT}")
                 _coal_resp.headers["ETag"] = f'"{final_cache_key}"'
                 # Coalescing only happens when caching is on (final_cache_key set),
                 # so no-store can't apply here — CDN TTL only.
@@ -3177,17 +3414,16 @@ async def get_poster(
                 release_date_for_quality_ttl = cached_release_date
                 logger.info(f"Rating coalesce succeeded for {imdb_id} — using cached result")
             else:
-                # The other fetch also failed; re-check back-off it may have set.
-                _loop_now2    = asyncio.get_running_loop().time()
-                _retry_key2 = _rating_retry_key(imdb_id, effective_mdblist_key)
-                _backoff_now2 = _rating_backoff.get(_retry_key2)
-                if _backoff_now2 is not None and _loop_now2 < _backoff_now2:
-                    logger.debug(
-                        f"Rating fetch for {imdb_id} suppressed after coalescence (back-off active)"
-                    )
-                    effective_mdblist_key = None
-                    _rating_backoff_active = True
-                    _mdblist_unavailable_reason = "selected key is in back-off for this title"
+                # The owner already made the MDBList attempt for this title.
+                # If it did not produce a cache row, do not launch a second
+                # same-content request from a waiter in the same burst.
+                logger.debug(
+                    f"Rating fetch for {imdb_id} suppressed after coalescence "
+                    "(owner did not cache rating)"
+                )
+                effective_mdblist_key = None
+                _rating_backoff_active = True
+                _mdblist_unavailable_reason = "coalesced fetch did not cache rating"
         else:
             # First request for this imdb_id — claim the fetch slot.
             _rating_event_to_set              = asyncio.Event()
@@ -3325,9 +3561,10 @@ async def get_poster(
                         f"(priority={rcfg.logo_priority})")
 
         if rating_already_cached or not effective_mdblist_key:
-            rating_coro = _resolved(
-                (cached_ratings_dict, cached_genre, cached_release_date, [], cached_age_rating)
-            )
+            rating_coro = _resolved((
+                None,
+                (cached_ratings_dict, cached_genre, cached_release_date, [], cached_age_rating),
+            ))
         else:
             global _mdblist_semaphore
             if _mdblist_semaphore is None:
@@ -3338,10 +3575,36 @@ async def get_poster(
                 _gids=genre_ids, _type=type,
                 _mw=effective_movie_weights, _tw=effective_tv_weights,
             ):
+                nonlocal _rating_backoff_active, _mdblist_unavailable_reason
                 async with _mdblist_semaphore:
-                    return await _with_retry(
-                        fetch_rating,
-                        _client, _imdb_id, _key, _gids, _type,
+                    _fetch_key = _key
+                    _fetch_now = asyncio.get_running_loop().time()
+                    if (
+                        _fetch_key in _cfg.SERVER_MDBLIST_KEYS
+                        and _fetch_now < _mdblist_key_cooldown.get(_fetch_key, 0.0)
+                    ):
+                        _replacement_key = _next_mdblist_server_key(_fetch_key, _fetch_now)
+                        if _replacement_key is None:
+                            _remaining = _mdblist_key_cooldown.get(_fetch_key, 0.0) - _fetch_now
+                            logger.debug(
+                                f"Rating fetch for {_imdb_id} skipped "
+                                f"({_mdblist_server_key_label(_fetch_key)} cooling down; "
+                                f"{_remaining:.0f}s remaining)"
+                            )
+                            _rating_backoff_active = True
+                            _mdblist_unavailable_reason = "selected key is cooling down"
+                            return None, (
+                                cached_ratings_dict, cached_genre,
+                                cached_release_date, [], cached_age_rating,
+                            )
+                        logger.info(
+                            f"MDBList key rotated from {_mdblist_server_key_label(_fetch_key)} "
+                            f"to {_mdblist_server_key_label(_replacement_key)} for {_imdb_id} "
+                            "before outbound fetch"
+                        )
+                        _fetch_key = _replacement_key
+                    return _fetch_key, await fetch_rating(
+                        _client, _imdb_id, _fetch_key, _gids, _type,
                         movie_weights=_mw, tv_weights=_tw,
                     )
 
@@ -3630,7 +3893,7 @@ async def get_poster(
         (
             image,
             logo,
-            rating_result,
+            rating_fetch_result,
             trending_rank,
         ) = await asyncio.gather(
             _image_coro,
@@ -3638,6 +3901,12 @@ async def get_poster(
             rating_coro,
             fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
         )
+
+        rating_key_used, rating_result = rating_fetch_result
+        if rating_key_used is not None:
+            effective_mdblist_key = rating_key_used
+        elif _rating_backoff_active:
+            effective_mdblist_key = None
 
         # A rate-limited server key gets one same-request rescue attempt on the
         # next healthy configured key. Query-supplied keys remain isolated.
@@ -3647,16 +3916,20 @@ async def get_poster(
                 imdb_id, _failed_key, rating_result
             )
             logger.warning(
-                f"MDBList key rate-limited for {imdb_id}; cooling down for "
-                f"{_backoff_secs:.0f}s"
+                f"MDBList {_mdblist_server_key_label(_failed_key)} rate-limited "
+                f"for {imdb_id}; cooling down for {_backoff_secs:.0f}s"
             )
             if _rescue_key is not None:
                 effective_mdblist_key = _rescue_key
                 logger.warning(
-                    f"Retrying MDBList for {imdb_id} with configured key "
-                    f"#{_mdblist_active_key_idx + 1}"
+                    f"Retrying MDBList for {imdb_id} with "
+                    f"{_mdblist_server_key_label(_rescue_key)}"
                 )
-                rating_result = await _fetch_rating_gated(_rescue_key)
+                _rescue_used_key, rating_result = await _fetch_rating_gated(_rescue_key)
+                if _rescue_used_key is not None:
+                    effective_mdblist_key = _rescue_used_key
+                elif _rating_backoff_active:
+                    effective_mdblist_key = None
 
         # Inline quality wait — runs after gather so rating coalescing is never
         # blocked.  Used for poster-warm workflows where latency doesn't matter.
@@ -3841,11 +4114,32 @@ async def get_poster(
         # ------------------------------------------------------------------
         _release_status: str | None = None
         _recent_digital_release_date: str | None = None
-        if "release_status" in rcfg.sash_priority:
-            _release_status = await fetch_release_status(
-                client, tmdb_id, effective_tmdb_key, type,
-                tmdb_data.get("tmdb_status"),
-            )
+        _rs_slots = {"release_status", "cinema", "streaming", "physical", "production", "ended", "cancelled", "airing"}
+        if any(s in rcfg.sash_priority for s in _rs_slots):
+            _fetch_rs = True
+            
+            import datetime
+            current_year = datetime.date.today().year
+            _check_year = None
+            
+            if type in ("tv", "series"):
+                _last_air = tmdb_data.get("last_air_date")
+                if _last_air and len(_last_air) >= 4 and _last_air[:4].isdigit():
+                    _check_year = _last_air[:4]
+                else:
+                    _check_year = release_year
+            else:
+                _check_year = release_year
+
+            if _check_year:
+                if (current_year - int(_check_year)) > _cfg.RELEASE_STATUS_MAX_AGE_YEARS:
+                    _fetch_rs = False
+            
+            if _fetch_rs:
+                _release_status = await fetch_release_status(
+                    client, tmdb_id, effective_tmdb_key, type,
+                    tmdb_data.get("tmdb_status"),
+                )
             # r/movieleaks confirmation overrides TMDB's theatrical/production
             # status — if the film is in the digital-release cache it's already
             # streaming regardless of what the official release dates say.
@@ -3992,7 +4286,8 @@ async def get_poster(
         def _composite_and_encode() -> bytes:
             result = build_poster(image, score, genre, rcfg, **_bp_args)
             buf = io.BytesIO()
-            result.convert("RGB").save(buf, format="JPEG", quality=_cfg.JPEG_QUALITY)
+            _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
+            result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
             return buf.getvalue()
 
         img_bytes = await asyncio.get_running_loop().run_in_executor(
@@ -4009,13 +4304,24 @@ async def get_poster(
         #                            would evaluate False without this separate flag
         if (final_cache_key is not None and not quality_pending and not _detection_deferred
                 and not rating_failed and not _rating_backoff_active):
-            set_cached_final_poster(final_cache_key, img_bytes)
+            _ttl_override = None
+            if discovery_meta is not None:
+                _sash_result = pick_sash(discovery_meta, rcfg.sash_priority)
+                if _sash_result and _sash_result[1] in ("trending", "trending_broad"):
+                    _ttl_override = 86400
+                    
+            set_cached_final_poster(
+                final_cache_key,
+                img_bytes,
+                request_params=_sanitize_request_params(request.url.query),
+                ttl_override=_ttl_override
+            )
             logger.info(f"Final poster cached for {final_cache_key}")
 
         if _render_fut is not None:
             _render_fut.set_result(img_bytes)
 
-        response = Response(content=img_bytes, media_type="image/jpeg")
+        response = Response(content=img_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}")
         if final_cache_key is not None:
             response.headers["ETag"] = f'"{final_cache_key}"'
         if _cfg.DISABLE_COMPOSITE_CACHE:
@@ -4033,7 +4339,7 @@ async def get_poster(
     except httpx.TimeoutException as exc:
         if _render_fut is not None and not _render_fut.done():
             _render_fut.set_exception(exc)
-        logger.warning(f"Upstream timeout for tmdb_id={tmdb_id}: {type(exc).__name__}")
+        logger.warning(f"Upstream timeout for tmdb_id={tmdb_id}: {exc.__class__.__name__}")
         raise HTTPException(status_code=504, detail="Upstream request timed out")
     except httpx.HTTPStatusError as exc:
         if _render_fut is not None and not _render_fut.done():
