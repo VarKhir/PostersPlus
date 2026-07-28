@@ -135,9 +135,10 @@ async def _coalesced_fetch_poster_metadata(
     tmdb_key: str,
     media_type: str,
     lang: str,
+    secondary_lang: str = "",
 ) -> tuple:
     endpoint = "tv" if media_type in ("tv", "series") else "movie"
-    inflight_key = tmdb_metadata_cache_key(endpoint, tmdb_id, lang)
+    inflight_key = tmdb_metadata_cache_key(endpoint, tmdb_id, lang, secondary_lang)
 
     existing = _metadata_inflight.get(inflight_key)
     if existing is not None:
@@ -150,7 +151,9 @@ async def _coalesced_fetch_poster_metadata(
     )
     _metadata_inflight[inflight_key] = fut
     try:
-        result = await fetch_poster_metadata(client, tmdb_id, tmdb_key, media_type, lang)
+        result = await fetch_poster_metadata(
+            client, tmdb_id, tmdb_key, media_type, lang, secondary_lang
+        )
         fut.set_result(result)
         return result
     except Exception as exc:
@@ -604,7 +607,15 @@ from ratings import (
     _score_color_alt,
     _score_color_metal,
 )
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H
+from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
+
+# Logo priorities that consult the secondary preferred language ("custom").
+# Elsewhere the secondary language is inert and must be kept out of the image
+# fetch / cache key so single-language requests keep their existing cache entry.
+_SECONDARY_LANGUAGE_PRIORITIES = frozenset({
+    "native_custom_text",
+    "native_custom_original_text",
+})
 import tvdb
 
 # ---------------------------------------------------------------------------
@@ -785,15 +796,23 @@ class RequestConfig:
     fallback_to_imdb: bool = False
 
     logo_language: str = field(default_factory=lambda: _cfg.DEFAULT_LOGO_LANGUAGE)
+    # Secondary preferred language ("custom").  Only consulted by the
+    # native_custom_* priorities below; blank elsewhere (and blank there degrades
+    # those modes to their non-custom equivalents).
+    logo_language_secondary: str = ""
     # Logo resolution priority.  "native" = the viewer's chosen logo_language
-    # (e.g. en); "original" = the content's own original language (e.g. ja for
-    # an anime).  "text" = render the translated title as text.
+    # (e.g. en); "custom" = logo_language_secondary; "original" = the content's
+    # own original language (e.g. ja for an anime).  "text" = render the
+    # translated title as text.
     #   "native_original" (default): native → original → text
     #   "original_native":           original → native → text
     #   "native_if_original_english": native if content is native, else English
     #                                 → original → text
     #   "native_text":               native → English → neutral → text
     #                                 (no original-language logo)
+    #   "native_custom_text":         native → custom → English → neutral → text
+    #   "native_custom_original_text": native → custom → original → English
+    #                                 → neutral → text
     logo_priority: str = "native_original"
     # Fallback-poster style for titles with no art: "minimal" (procedural textured
     # backdrop) or "photoreal" (hand-made photographic art that blends with real
@@ -1094,12 +1113,17 @@ def build_request_config(params: dict) -> RequestConfig:
     cfg.fallback_to_imdb = _b("fallback_to_imdb", cfg.fallback_to_imdb)
 
     cfg.logo_language        = (params.get("logo_language", cfg.logo_language).strip().lower())
+    cfg.logo_language_secondary = (
+        params.get("logo_language_secondary", cfg.logo_language_secondary).strip().lower()
+    )
     _lp = params.get("logo_priority")
     if _lp in (
         "native_original",
         "original_native",
         "native_if_original_english",
         "native_text",
+        "native_custom_text",
+        "native_custom_original_text",
     ):
         cfg.logo_priority = _lp
     elif "logo_native_fallback" in params:
@@ -3512,11 +3536,21 @@ async def get_poster(
         raise HTTPException(status_code=503, detail="Service unavailable")
     client = _HTTP_CLIENT
 
+    # Secondary preferred language, only when the chosen priority actually uses it.
+    _effective_secondary = (
+        rcfg.logo_language_secondary
+        if rcfg.logo_priority in _SECONDARY_LANGUAGE_PRIORITIES
+        else ""
+    )
+
     global _active_poster_renders
     _active_poster_renders += 1
     try:
         genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
-            await _coalesced_fetch_poster_metadata(client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language)
+            await _coalesced_fetch_poster_metadata(
+                client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+                _effective_secondary,
+            )
         )
         # Canonical IMDb id for downstream lookups (e.g. TVDB remoteid resolution):
         # the request param if supplied, else the one TMDB returned in external_ids.
@@ -3560,7 +3594,7 @@ async def get_poster(
         _p_default = tmdb_data.get("original_poster_path")
         _original_lang = tmdb_data.get("original_language") or ""
         _poster_language_order = image_language_order(
-            rcfg.logo_language, _original_lang, rcfg.logo_priority
+            rcfg.logo_language, _original_lang, rcfg.logo_priority, _effective_secondary
         )
         _priority_lang = _poster_language_order[0] if _poster_language_order else ""
         _ranked_posters = [
@@ -3895,6 +3929,7 @@ async def get_poster(
                     original_language=tmdb_data.get("original_language"),
                     logo_priority=rcfg.logo_priority,
                     use_metahub=use_metahub,
+                    secondary_language=_effective_secondary,
                 )
 
             async def _tvdb():
@@ -3902,6 +3937,7 @@ async def get_poster(
                     client, media_type=type, logo_language=rcfg.logo_language,
                     original_language=tmdb_data.get("original_language"),
                     logo_priority=rcfg.logo_priority,
+                    secondary_language=_effective_secondary,
                     imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
                 )
 
@@ -3909,9 +3945,10 @@ async def get_poster(
                 return (await _fetch_metahub_logo(client, effective_imdb_id)
                         if effective_imdb_id else None)
 
-            # This mode has its own explicit order: TMDB native -> TMDB English
-            # -> Metahub -> TMDB neutral -> rendered text.
-            if rcfg.logo_priority == "native_text":
+            # These modes have their own explicit order: TMDB language buckets
+            # (native, then custom/original for the native_custom_* variants) ->
+            # TMDB English -> Metahub -> TMDB neutral -> rendered text.
+            if rcfg.logo_priority in _TEXT_FORWARD_LOGO_PRIORITIES:
                 return await _tmdb(use_metahub=True)
 
             if _tvdb_logo_pri == 1:
@@ -3941,6 +3978,12 @@ async def get_poster(
 
         # A rate-limited server key gets one same-request rescue attempt on the
         # next healthy configured key. Query-supplied keys remain isolated.
+        #
+        # This rescue is hand-rolled rather than routed through _with_retry on
+        # purpose: _with_retry re-calls blindly on FETCH_FAILED, so wrapping the
+        # rating fetch would fire a second request at the key that just returned
+        # 429 — before the cooldown below can register it — doubling load on a
+        # key that explicitly asked us to back off. Rotate first, then retry.
         if isinstance(rating_result, _RateLimited) and effective_mdblist_key:
             _failed_key = effective_mdblist_key
             _backoff_secs, _rescue_key = _mark_mdblist_rate_limit(
@@ -4147,30 +4190,16 @@ async def get_poster(
         _recent_digital_release_date: str | None = None
         _rs_slots = {"release_status", "cinema", "streaming", "physical", "production", "ended", "cancelled", "airing"}
         if any(s in rcfg.sash_priority for s in _rs_slots):
-            _fetch_rs = True
-            
-            import datetime
-            current_year = datetime.date.today().year
-            _check_year = None
-            
-            if type in ("tv", "series"):
-                _last_air = tmdb_data.get("last_air_date")
-                if _last_air and len(_last_air) >= 4 and _last_air[:4].isdigit():
-                    _check_year = _last_air[:4]
-                else:
-                    _check_year = release_year
-            else:
-                _check_year = release_year
-
-            if _check_year:
-                if (current_year - int(_check_year)) > _cfg.RELEASE_STATUS_MAX_AGE_YEARS:
-                    _fetch_rs = False
-            
-            if _fetch_rs:
-                _release_status = await fetch_release_status(
-                    client, tmdb_id, effective_tmdb_key, type,
-                    tmdb_data.get("tmdb_status"),
-                )
+            # Resolved for every title regardless of age.  There used to be an
+            # age gate here that skipped the lookup for anything older than a
+            # configurable limit, but it silently blanked the status on older
+            # titles — which read as a bug rather than a setting.  Results are
+            # cached, and stale "Cinema" on an old film is handled properly by
+            # CINEMA_MAX_AGE_YEARS, which downgrades it to "Streaming".
+            _release_status = await fetch_release_status(
+                client, tmdb_id, effective_tmdb_key, type,
+                tmdb_data.get("tmdb_status"),
+            )
             # r/movieleaks confirmation overrides TMDB's theatrical/production
             # status — if the film is in the digital-release cache it's already
             # streaming regardless of what the official release dates say.
