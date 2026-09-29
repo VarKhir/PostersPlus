@@ -857,7 +857,7 @@ def _draw_graphic_badges(image: Image.Image, before: np.ndarray, cfg, tokens: li
     pill_h = int(height * _BADGE_FONT * scale) + 2 * round(_BADGE_PAD_Y * scale)
     top_line = int(height * _BADGE_TOP) + pill_h / 2
 
-    for group in graphic_badges.resolve_groups(cfg.badge_group1, cfg.badge_group2, cfg.badge_group3):
+    for group in graphic_badges.cfg_groups(cfg):
         unit = max(8, round(height * _GB_UNIT * group.size / DEFAULT_SIZE))
         # Spacing is a fraction of a portrait width; keyed to height here, as
         # every size on this canvas is.  At the default it is the portrait gap.
@@ -907,6 +907,7 @@ def build_landscape(
     age_rating: int | None = None,
     certification: str | None = None,
     badge_logos: tuple = (None, None),
+    cinema_run=None,
     **_ignored,
 ) -> Image.Image:
     """Render the landscape poster.  Mirrors ``build_poster``'s call shape so the
@@ -1010,12 +1011,11 @@ def build_landscape(
         where = {"top": int(height * _BADGE_TOP)} if info_row == "top" else {}
         if info_row != logo_row:
             info_box = _strip(bounds=full, **where)
-        elif auto_info and logo_box is None and not (logo_left == logo_right == 0):
-            # No logo drawn: the line keeps clear of the widest a logo may be,
-            # as it always has (an empty logo, which drew nothing, doesn't count).
-            info_box = _strip(logo_left=None, logo_right=None, **where)
         else:
-            # The logo's side of the row is the logo's.
+            # The logo's side of the row is the logo's.  With nothing drawn
+            # there (original art carries its own title) the row is all the
+            # line's: keeping clear of a logo that isn't there only cost it
+            # the genre.
             lo, hi = full
             if logo_box:
                 if info_col == "left" or (info_col == "center" and align == "right"):
@@ -1048,6 +1048,13 @@ def build_landscape(
 
     # Drawn last because they lay themselves out around everything else.
     if graphic:
+        import graphic_badges
+        tint = None
+        if cinema_run is not None and cfg.badge_cinema_style == "frosted":
+            from awards import dominant_frost_rgb, _frosted_tint
+            tint = _frosted_tint(*(badge_source or dominant_frost_rgb(art)),
+                                 saturation=cfg.sash_badge_frost_saturation, reference=cfg.frost_reference)
+        badge_logos = (*badge_logos[:2], graphic_badges.cinema_ink(cfg.badge_cinema_style, cinema_run, tint))
         _draw_graphic_badges(image, before, cfg, quality_tokens or [], certification, age_rating,
                              badge_logos, logo_box, badge_position)
 

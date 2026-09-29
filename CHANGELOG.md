@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+### A fourth graphic badge group
+
+- Graphic badges can be split across four groups instead of three
+  (`badge_group4`, and `landscape_badge_group4` for landscape), each with
+  its own anchor, max, size and spacing.
+
+### Popcorn badge for films still in cinemas
+
+- Graphic badges have a new **In Cinemas (Popcorn)** badge (`cinema` in a
+  badge group). It shows on a film that is only in cinemas or not out yet,
+  so the poster can say so without the Cinema sash, or while the sash shows
+  something else.
+- **Popcorn Colour** (`badge_cinema_style`): By Streaming Date (default)
+  turns it green inside a week of the film's digital release, amber inside
+  two weeks, and red further off or when there is no date. Red, Black,
+  White and Frosted are fixed colours.
+
+### Edit the studio, director and cast lists in the dashboard
+
+- The admin dashboard has a **Sash lists** view for the notable studios,
+  directors and cast behind the Studio, Director and Cast sashes. It shows
+  each list with TMDB pictures, lets you remove entries, change the label a
+  sash shows, and search TMDB to add a studio or person, so names match
+  TMDB's credits exactly. Entries TMDB has no exact credit for are flagged,
+  since they can never match. Each list can go back to the built-in one.
+- Four built-in entries never matched because TMDB spells them differently:
+  BBC Film, LAIKA, Bong Joon Ho and Wong Kar-Wai. They now do, so films
+  such as Aftersun, Coraline and Parasite get their sash.
+- Changes apply without a restart. `discovery_overrides.json` is still where
+  the lists live and can still be written by hand; it is now re-read within
+  a few seconds of changing.
+
+### Choose a title's art for everyone; TVDB as a poster source
+
+- The admin dashboard has an **Artwork** tab. Search for a title and pick its
+  textless poster, its Original Art poster, its logo and its landscape art
+  from every TMDB, Fanart and TVDB image. The choice applies to everyone on the instance.
+  Posters and logos are chosen per language, following each user's language
+  order. A poster choice replaces the poster sources you tick (TMDB,
+  Fanart, TVDB), and users on other sources get their usual pick. Only the
+  images you choose are downloaded, once, however many users there are.
+- You can also paste a link to any image, such as a ThePosterDB download
+  link, or upload one. The server keeps its own copy.
+- For titles with no textless poster, a backdrop can be cropped by hand into
+  the textless poster: drag a poster-shaped frame over it and zoom as needed.
+- An optional configurator shortcut (off by default, switched on in the
+  editor) opens the previewed title's artwork in the dashboard.
+- TVDB can be offered as a poster source (`TVDB_POSTER_SOURCE`,
+  `poster_source=tvdb`). It uses TVDB's best no-language poster, which on
+  TVDB means textless, or under Original Art its best poster in the user's
+  language. Titles TVDB has nothing for keep their TMDB poster.
+- The TVDB poster fallback (`TVDB_USE_POSTERS`) now only uses a no-language
+  TVDB poster to replace a poster with text. It used to try one in the
+  user's language first, and nearly all of those carry the title, often in a
+  style the text scan misses.
+
 ### Landscape logo position, top band and graphic badges; per-type rating badges
 
 - Landscape: the logo can sit left, centre or right, in the bottom row or at

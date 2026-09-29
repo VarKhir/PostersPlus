@@ -24,7 +24,7 @@ from typing import Callable
 from functools import lru_cache, partial
 from html import escape as _html_escape
 from urllib.parse import parse_qsl, quote, urlencode
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -859,7 +859,7 @@ from age_badge import draw_quality_age_badge, draw_quality_corner_bookmark, draw
 from landscape import build_landscape
 import pxscale
 from pxscale import px, pxi, pxr, pxri, fixed, fixedi
-from awards import dominant_frost_rgb
+from awards import dominant_frost_rgb, _frosted_tint
 from awards import FETCH_FAILED, _RateLimited, draw_award_badge, draw_award_sash, parse_mdblist_awards, reconcile_cached_awards
 from awards import _SIDE_MARGIN as awards_side_margin, side_chip_band, _notch_heights as notch_heights
 import graphic_badges
@@ -911,6 +911,7 @@ import watchlist
 import admin as _admin
 from imdb_dataset import imdb_dataset_refresh_loop
 import config as _cfg
+import discovery
 from discovery import (
     ALL_PRIORITY_SLOTS,
     RELEASE_STATUS_SLOTS,
@@ -950,13 +951,15 @@ from ratings import (
     _score_color_alt,
     _score_color_metal,
 )
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank_entry, ensure_trending_snapshot, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, parse_logo_priority, logo_priority_sources, logo_priority_uses_custom, logo_priority_draws_text, resolve_imdb_to_tmdb, resolve_tmdb_to_imdb, IdResolveError, poster_image_cache_key, backdrop_image_cache_key, trending_source_url, _compute_movie_status_from_dates, _parse_tmdb_date, fetch_badge_facts, fetch_network_logo_path, poster_canvas, set_poster_canvas, POSTER_WIDTHS
+from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank_entry, ensure_trending_snapshot, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, parse_logo_priority, logo_priority_sources, logo_priority_uses_custom, logo_priority_draws_text, resolve_imdb_to_tmdb, resolve_tmdb_to_imdb, IdResolveError, poster_image_cache_key, backdrop_image_cache_key, trending_source_url, _compute_movie_status_from_dates, _parse_tmdb_date, fetch_badge_facts, fetch_network_logo_path, poster_canvas, set_poster_canvas, POSTER_WIDTHS, fetch_logo_image, logo_language_steps, logo_step_available, _image_matches_language, sanitise_source_url, fetch_cropped_art
 # How long a poster rendered while its trending list was unreadable is kept:
 # the same as that list's retry cooldown.
 from tmdb import _TRENDING_SOURCE_RETRY_SECS as _TRENDING_UNREAD_TTL
 
 import tvdb
 import anime
+import art_overrides
+import fanart
 import cinemeta
 
 # ---------------------------------------------------------------------------
@@ -1713,6 +1716,9 @@ class RequestConfig:
     badge_group1:             str  = graphic_badges.DEFAULT_GROUP1
     badge_group2:             str  = ""
     badge_group3:             str  = ""
+    badge_group4:             str  = ""
+    # The "cinema" slot's popcorn colour — graphic_badges.CINEMA_STYLES.
+    badge_cinema_style:       str  = graphic_badges.DEFAULT_CINEMA_STYLE
 
     movie_weights: dict | None = None
     tv_weights:    dict | None = None
@@ -1763,6 +1769,8 @@ class RequestConfig:
     # or in the logo language under original art; TMDB fallback; needs the
     # operator's FANART_POSTERS + key).  "fanart_anime" is fanart.tv for anime
     # (Japanese animation, or a request by anime id) and TMDB for the rest.
+    # "tvdb" is TVDB's no-language (textless) poster, or under original art
+    # one in the request's language; needs TVDB_POSTER_SOURCE + the TVDB key.
     poster_source: str = "tmdb"
     # "top" (default) or "random": one of the source's top five candidates,
     # re-rolled each time the poster renders.  Needs RANDOM_POSTERS.
@@ -1848,7 +1856,7 @@ class RequestConfig:
     # Graphic badges on landscape (landscape_badge_display_mode=7).  Opt-in
     # and apart from badge_display_mode: one "{shape}" URL is two configs, and
     # the portrait's badge mode must not decide the landscape's.  The groups
-    # are the split badge_group1-3 (landscape_badge_group1, ...).
+    # are the split badge_group1-4 (landscape_badge_group1, ...).
     landscape_graphic_badges: bool = False
     # Where the landscape "Genre • Year • Score" line goes: "auto" (placed
     # against the logo, see landscape.build_landscape) or a slot of its own,
@@ -1965,9 +1973,7 @@ _LANDSCAPE_SPLIT_PARAMS: tuple[str, ...] = (
     "textless",
     "sash_mode",
     # Landscape's own graphic badge groups, drawn only with landscape_badge_display_mode=7.
-    "badge_group1",
-    "badge_group2",
-    "badge_group3",
+    *graphic_badges.GROUP_PARAMS,
 )
 
 
@@ -2181,12 +2187,10 @@ def _uses_quality(cfg: "RequestConfig") -> bool:
     and studio come from TMDB alone.  Landscape draws graphic badges only, and
     only when it opts in (landscape_graphic_badges)."""
     if cfg.shape == "landscape":
-        return cfg.landscape_graphic_badges and graphic_badges.groups_use_quality(
-            cfg.badge_group1, cfg.badge_group2, cfg.badge_group3)
+        return cfg.landscape_graphic_badges and graphic_badges.groups_use_quality(cfg)
     if cfg.badge_display_mode in _QUALITY_BADGE_MODES:
         return True
-    return cfg.badge_display_mode == 7 and graphic_badges.groups_use_quality(
-        cfg.badge_group1, cfg.badge_group2, cfg.badge_group3)
+    return cfg.badge_display_mode == 7 and graphic_badges.groups_use_quality(cfg)
 
 
 def _gradient_alpha(opacity: float) -> int:
@@ -2551,9 +2555,12 @@ def build_request_config(params: dict) -> RequestConfig:
                                   _i("combined_badge_min_score", cfg.badge_min_score, 2, 6),
                                   2, 6)
     cfg.combined_badge_stacked   = _b("combined_badge_stacked",   cfg.combined_badge_stacked)
-    for _gname in ("badge_group1", "badge_group2", "badge_group3"):
+    for _gname in graphic_badges.GROUP_PARAMS:
         if _gname in params:
             setattr(cfg, _gname, graphic_badges.format_group(graphic_badges.parse_group(params[_gname])))
+    _cinema_style = (params.get("badge_cinema_style") or "").strip().lower()
+    if _cinema_style in graphic_badges.CINEMA_STYLES:
+        cfg.badge_cinema_style = _cinema_style
 
     all_sources = list(_cfg.MOVIE_WEIGHTS.keys())
     cfg.movie_weights = _parse_weights(params.get("movie_weights"), all_sources)
@@ -2597,6 +2604,8 @@ def build_request_config(params: dict) -> RequestConfig:
     # Parsed as "tmdb" while the operator hasn't enabled fanart, so those
     # requests share the TMDB composite rather than minting an identical one.
     if _pss in ("fanart", "fanart_anime") and _cfg.FANART_POSTERS and _cfg.FANART_API_KEY:
+        cfg.poster_source = _pss
+    elif _pss == "tvdb" and tvdb.poster_source_enabled():
         cfg.poster_source = _pss
     # Likewise "top" while the operator hasn't allowed random picks.  Landscape
     # draws from backdrops, which neither setting touches.
@@ -3684,9 +3693,14 @@ def _build_poster(
     badge_logos: tuple = (None, None),   # (network, studio) graphic_badges.Logo, or None each
     ratings: dict | None = None,         # per-provider scores, for rating badges
     media_kind: str | None = None,       # "movie" | "series" | "anime", for the ribbon's label
+    cinema_run: "graphic_badges.CinemaRun | None" = None,   # the popcorn badge's facts
 ) -> Image.Image:
 
     width, height = image.size
+    # The popcorn rides with the logos into row_items.  A frosted one takes
+    # the frost colour, which isn't sampled yet: any colour does for the
+    # layout decisions made before it is.
+    badge_logos = (*badge_logos[:2], graphic_badges.cinema_ink(cfg.badge_cinema_style, cinema_run))
 
     # An "auto" notch takes its side from where the graphic badges go, so
     # resolve it before anything reads the position.
@@ -4067,7 +4081,7 @@ def _build_poster(
     # changed rather than re-derived from composite_logo's sizing rules.
     _logo_groups = _before_overlays is not None and any(
         g.anchor in graphic_badges.LOGO_ANCHORS
-        for g in graphic_badges.resolve_groups(cfg.badge_group1, cfg.badge_group2, cfg.badge_group3))
+        for g in graphic_badges.cfg_groups(cfg))
     _before_logo = image.copy() if _logo_groups else None
 
     # --- Logo / fallback title ---
@@ -4290,7 +4304,8 @@ def _build_poster(
                        and cfg.trending_ribbon_style == "frosted")
     _frost_tint: tuple[float, float, float] | None = (
         dominant_frost_rgb(_frost_color_src)
-        if (_bar_frosted or _notch_frosted or _sash_poster or _ribbon_frosted) else None
+        if (_bar_frosted or _notch_frosted or _sash_poster or _ribbon_frosted
+            or (cinema_run is not None and cfg.badge_cinema_style == "frosted")) else None
     )
     # A tinted vignette and a frosted notch sample the same artwork but answer
     # different questions — the vignette asks what the band's own stretch of art is
@@ -4791,6 +4806,9 @@ def _build_poster(
     # --- Graphic badge groups ---
     # Drawn last because they lay themselves out around everything else.
     if _before_overlays is not None:
+        if cinema_run is not None and cfg.badge_cinema_style == "frosted" and _frost_tint is not None:
+            badge_logos = (*badge_logos[:2], graphic_badges.cinema_ink(
+                "frosted", cinema_run, _frosted_tint(*_frost_tint, saturation=_frost_sat, reference=_frost_ref)))
         _draw_graphic_badges(image, cfg, quality_tokens or [], certification, age_rating,
                              _before_overlays, spread_beside_chip=_auto_notch, logo_box=_logo_box,
                              logos=badge_logos)
@@ -4895,7 +4913,7 @@ def _auto_notch_pos(cfg: "RequestConfig", tokens: list[str], certification: str 
         return "center"
     show_quality = bool(tokens) and _score_points(tokens) >= cfg.badge_min_score
     left = right = beside = False
-    for group in graphic_badges.resolve_groups(cfg.badge_group1, cfg.badge_group2, cfg.badge_group3):
+    for group in graphic_badges.cfg_groups(cfg):
         # Whether it draws anything is all that matters here; any size will do.
         if not graphic_badges.row_items(tokens, certification, age_rating, 20,
                                         group.slots, show_quality, *logos)[:group.max_items]:
@@ -4955,7 +4973,7 @@ def _draw_graphic_badges(image: Image.Image, cfg: "RequestConfig", tokens: list[
         notch_y = max(-badge_h, px(height * cfg.sash_badge_inset))
         top_line = (max(0, notch_y) + notch_y + badge_h) / 2
 
-    groups = graphic_badges.resolve_groups(cfg.badge_group1, cfg.badge_group2, cfg.badge_group3)
+    groups = graphic_badges.cfg_groups(cfg)
     for group in groups:
         g_unit = max(8, round(group.size * 1.5 * height / 750))
         g_gap = px(width * group.spacing)
@@ -6621,7 +6639,12 @@ async def server_caps(access_key: str = ""):
         "max_poster_resolution": max(_cfg.MAX_POSTER_RESOLUTION, _cfg.POSTER_WIDTH),
         "preview_at_resolution": bool(_cfg.PREVIEW_AT_RESOLUTION),
         "fanart_posters":        bool(_cfg.FANART_POSTERS and _cfg.FANART_API_KEY),
+        "tvdb_posters":          tvdb.poster_source_enabled(),
         "random_posters":        bool(_cfg.RANDOM_POSTERS),
+        # The preview's "edit this title's artwork" shortcut into the dashboard.
+        # Off unless the operator turns it on: on a public instance it would
+        # only point visitors at a login they can't pass.
+        "artwork_edit_link":     _admin.enabled() and _artwork_edit_link_on(),
     }
 
 
@@ -6853,7 +6876,7 @@ def _compute_render_assets_signature() -> str:
                     continue
                 digest.update(os.path.relpath(path, BASE_DIR).encode())
                 digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
-    override_path = _cfg.DISCOVERY_OVERRIDES_PATH
+    override_path = discovery.override_path()
     try:
         with open(override_path, "rb") as override_file:
             digest.update(override_file.read())
@@ -6863,6 +6886,11 @@ def _compute_render_assets_signature() -> str:
 
 
 def _server_render_signature() -> str:
+    global _render_assets_signature
+    # The dashboard's sash-list editor rewrites the overrides file on one
+    # worker; the others notice here and re-render under the new lists.
+    if discovery.refresh_overrides():
+        _render_assets_signature = _compute_render_assets_signature()
     return "|".join((
         f"render={_RENDER_CACHE_VERSION}",
         f"format={_cfg.IMAGE_FORMAT}",
@@ -7046,6 +7074,490 @@ async def _admin_simkl_unlink() -> dict:
 
 
 _admin.register(_build_stats, _load_admin_html, _admin_simkl_unlink)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard → Artwork: the operator picks a title's poster and logo for the
+# whole instance (see art_overrides).  Here rather than in admin.py because
+# it needs the HTTP client, the TMDB key and the metadata fetch; the key
+# check is admin.py's.  Candidates come back as paths plus thumbnail urls the
+# page loads straight from the providers' CDNs, so browsing costs this server
+# a few API calls and no image downloads; an image is fetched only once a
+# render needs it.
+# ---------------------------------------------------------------------------
+
+_TMDB_IMG = "https://image.tmdb.org/t/p"
+_ARTWORK_EDIT_LINK_KEY = "artwork_edit_link"
+
+
+def _artwork_edit_link_on() -> bool:
+    return get_app_state(_ARTWORK_EDIT_LINK_KEY) == "1"
+
+
+def _art_media_type(value: str) -> str:
+    if value not in ("movie", "tv", "series"):
+        raise HTTPException(status_code=400, detail="media_type must be movie or tv")
+    return art_overrides.media_kind(value)
+
+
+def _art_client_and_key() -> tuple[httpx.AsyncClient, str]:
+    if _HTTP_CLIENT is None:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    if not _cfg.SERVER_TMDB_KEY:
+        raise HTTPException(status_code=400, detail="The Artwork view needs the server's TMDB key")
+    return _HTTP_CLIENT, _cfg.SERVER_TMDB_KEY
+
+
+def _tmdb_art_item(image: dict, kind: str) -> dict:
+    path = image.get("file_path") or ""
+    if kind == "logos":
+        thumb = f"{_TMDB_IMG}/{'original' if path.lower().endswith('.svg') else 'w300'}{path}"
+    elif kind == "backdrops":
+        thumb = f"{_TMDB_IMG}/w300{path}"
+    else:
+        thumb = f"{_TMDB_IMG}/w185{path}"
+    language = image.get("iso_639_1") or None
+    region = image.get("iso_3166_1") or ""
+    if language and region:
+        language = f"{language}-{region.lower()}"
+    return {
+        "path": path, "thumb": thumb, "language": language,
+        "score": round(float(image.get("vote_average") or 0), 2),
+        "votes": image.get("vote_count") or 0,
+        "width": image.get("width"), "height": image.get("height"),
+    }
+
+
+def _default_logo_path(logos: list[dict], language: str, original_language: str | None) -> str | None:
+    """The TMDB logo a default-config request in *language* gets (Metahub and
+    TVDB, the later fallbacks, aren't looked up for the page)."""
+    for step in logo_language_steps(language, original_language, "native_original"):
+        if step == "metahub" or not logo_step_available(logos, step):
+            continue
+        matching = [
+            lg for lg in logos
+            if ((lg.get("iso_639_1") in (None, "")) if step == "null"
+                else _image_matches_language(lg, step))
+            and lg.get("file_path", "").lower().endswith((".png", ".svg"))
+        ]
+        matching.sort(key=lambda lg: lg.get("vote_average", 0) or 0, reverse=True)
+        return matching[0]["file_path"] if matching else None
+    return None
+
+
+@app.get("/admin/api/art/search")
+async def admin_art_search(request: Request, q: str = "",
+                           x_admin_key: str = Header(default="")):
+    await _admin._authorise(request, x_admin_key)
+    q = q.strip()
+    if not q or len(q) > 200:
+        raise HTTPException(status_code=400, detail="Query missing or too long")
+    client, key = _art_client_and_key()
+    resp = await _proxy_tmdb_get(
+        "https://api.themoviedb.org/3/search/multi",
+        {"api_key": key, "query": q, "include_adult": "false", "page": "1"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"TMDB search returned {resp.status_code}")
+    results = []
+    for r in (resp.json().get("results") or []):
+        if r.get("media_type") not in ("movie", "tv"):
+            continue
+        date = r.get("release_date") or r.get("first_air_date") or ""
+        results.append({
+            "tmdb_id": str(r["id"]),
+            "media_type": r["media_type"],
+            "title": r.get("title") or r.get("name") or "",
+            "year": date[:4],
+            "thumb": f"{_TMDB_IMG}/w92{r['poster_path']}" if r.get("poster_path") else None,
+            "overridden": art_overrides.for_title(r["media_type"], str(r["id"])) is not None,
+        })
+    return _admin._json({"results": results})
+
+
+@app.get("/admin/api/art/title")
+async def admin_art_title(request: Request, media_type: str, tmdb_id: str,
+                          language: str = "en", x_admin_key: str = Header(default="")):
+    """Everything the picker shows for one title: what a default-config
+    request in *language* gets today, every candidate per provider, and the
+    title's overrides."""
+    await _admin._authorise(request, x_admin_key)
+    media_type = _art_media_type(media_type)
+    _check_tmdb_id(tmdb_id)
+    language = _clean_language(language, "en") or "en"
+    client, key = _art_client_and_key()
+
+    (_, is_textless, logos, year, title, poster_path, backdrop_path, tmdb_data) = (
+        await _coalesced_fetch_poster_metadata(client, tmdb_id, key, media_type, language)
+    )
+    imdb_id = tmdb_data.get("imdb_id")
+    original_language = tmdb_data.get("original_language")
+
+    images_resp = await _proxy_tmdb_get(
+        f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/images", {"api_key": key},
+    )
+    images = images_resp.json() if images_resp.status_code == 200 else {}
+
+    def _safe(coro_result, name):
+        if isinstance(coro_result, Exception):
+            logger.warning(f"Artwork view: {name} candidates failed for {tmdb_id}: {coro_result}")
+            return {"posters": [], "logos": [], "backdrops": [], "error": str(coro_result)[:200]}
+        return coro_result
+
+    fanart_c, tvdb_c = await asyncio.gather(
+        fanart.artwork_candidates(client, media_type=media_type, tmdb_id=tmdb_id, imdb_id=imdb_id),
+        tvdb.artwork_candidates(client, media_type=media_type, tmdb_id=tmdb_id, imdb_id=imdb_id),
+        return_exceptions=True,
+    )
+    candidates = {
+        "tmdb": {
+            kind: [_tmdb_art_item(i, kind) for i in (images.get(kind) or []) if i.get("file_path")]
+            for kind in ("posters", "logos", "backdrops")
+        },
+        "fanart": _safe(fanart_c, "fanart.tv"),
+        "tvdb": _safe(tvdb_c, "TVDB"),
+    }
+
+    plangs = tmdb_data.get("poster_langs") or {}
+    orig_order = image_language_order(language, original_language, "native_original")
+    orig_default = next((plangs[lang] for lang in orig_order if plangs.get(lang)), None) \
+        or tmdb_data.get("original_poster_path")
+    # Landscape original art: TMDB's best text-bearing backdrop in the first
+    # language of the order that has one (the render takes the best of the
+    # languages it fetched, which is close enough to show here).
+    text_backdrops = sorted(
+        (b for b in (images.get("backdrops") or []) if b.get("iso_639_1")),
+        key=lambda b: -(b.get("vote_average") or 0))
+    ls_orig_default = next(
+        (b["file_path"] for lang in orig_order for b in text_backdrops
+         if _image_matches_language(b, lang)), None) or tmdb_data.get("text_backdrop_path")
+    return _admin._json({
+        "media_type": media_type,
+        "tmdb_id": tmdb_id,
+        "title": title,
+        "year": year,
+        "language": language,
+        "original_language": original_language,
+        "current": {
+            "textless": (
+                {"path": poster_path, "kind": "poster"} if poster_path and is_textless
+                else {"path": backdrop_path, "kind": "backdrop"} if backdrop_path
+                else {"path": poster_path, "kind": "poster"} if poster_path
+                else None
+            ),
+            "original": {"path": orig_default, "kind": "poster"} if orig_default else None,
+            "logo": (lambda p: {"path": p, "kind": "logo"} if p else None)(
+                _default_logo_path(logos, language, original_language)),
+            "landscape": {"path": backdrop_path, "kind": "backdrop"} if backdrop_path else None,
+            "landscape_original": {"path": ls_orig_default, "kind": "backdrop"} if ls_orig_default else None,
+        },
+        "candidates": candidates,
+        "providers": {
+            "fanart": bool(_cfg.FANART_API_KEY),
+            "tvdb": tvdb.tvdb_enabled(),
+        },
+        # Which sources users can pick, so the page can say an override for
+        # an unoffered source would never be used.
+        "offered_sources": {
+            "tmdb": True,
+            "fanart": fanart.fanart_enabled(),
+            "tvdb": tvdb.poster_source_enabled(),
+        },
+        "overrides": art_overrides.title_overrides(media_type, tmdb_id),
+        "edit_link": _artwork_edit_link_on(),
+        # For the page's live preview (<img> can't send the admin header).
+        # The access key is in every poster URL an instance hands out, so the
+        # operator seeing it here gives nothing away.
+        "access_key": _cfg.ACCESS_KEY or "",
+    })
+
+
+@app.put("/admin/api/art/edit-link")
+async def admin_art_edit_link(request: Request, x_admin_key: str = Header(default="")):
+    """Body: {"enabled": bool}.  Applies at once: the configurator reads it
+    from /server-caps when it loads."""
+    await _admin._authorise(request, x_admin_key)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    enabled = bool(isinstance(body, dict) and body.get("enabled") is True)
+    set_app_state(_ARTWORK_EDIT_LINK_KEY, "1" if enabled else "0")
+    return _admin._json({"enabled": enabled})
+
+
+@app.get("/admin/api/art/overrides")
+async def admin_art_overrides(request: Request, x_admin_key: str = Header(default="")):
+    await _admin._authorise(request, x_admin_key)
+    return _admin._json({"titles": art_overrides.list_overrides()})
+
+
+def _art_set(fields: dict, path: str) -> dict:
+    try:
+        override = art_overrides.set_override(
+            _art_media_type(str(fields.get("media_type") or "")),
+            str(fields.get("tmdb_id") or ""),
+            str(fields.get("slot") or ""),
+            fields.get("language"),
+            path,
+            fields.get("sources") if isinstance(fields.get("sources"), list) else None,
+            str(fields.get("title") or ""),
+            fields.get("crop") if isinstance(fields.get("crop"), dict) else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _admin._json({"override": override.as_dict()})
+
+
+async def _art_store(data: bytes, slot: str) -> str:
+    if slot not in art_overrides.SLOTS:
+        raise HTTPException(status_code=400, detail="bad slot")
+    try:
+        return await asyncio.to_thread(
+            art_overrides.store_custom_image, data, kind=art_overrides.image_kind(slot))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.put("/admin/api/art/override")
+async def admin_art_set(request: Request, x_admin_key: str = Header(default="")):
+    """Body: {media_type, tmdb_id, slot, language, sources, title} and either
+    a candidate's "path" or a "url" to any image, which is downloaded now and
+    kept (ThePosterDB's download links, say)."""
+    await _admin._authorise(request, x_admin_key)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    url = str(body.get("url") or "").strip()
+    if not url:
+        return _art_set(body, str(body.get("path") or ""))
+    if len(url) > 2048:
+        raise HTTPException(status_code=400, detail="Link too long")
+    if _HTTP_CLIENT is None:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    # Checked before the download so a bad title or slot costs nothing.
+    _art_media_type(str(body.get("media_type") or ""))
+    _check_tmdb_id(str(body.get("tmdb_id") or ""))
+    try:
+        data = await art_overrides.download_custom_url(_HTTP_CLIENT, url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Couldn't use that link: {exc}")
+    logger.info(f"Artwork: downloaded {len(data)} bytes from {sanitise_source_url(url)}")
+    return _art_set(body, await _art_store(data, str(body.get("slot") or "")))
+
+
+@app.post("/admin/api/art/upload")
+async def admin_art_upload(request: Request, media_type: str, tmdb_id: str, slot: str,
+                           language: str | None = None, sources: str = "",
+                           title: str = "", x_admin_key: str = Header(default="")):
+    """The image file itself as the request body; the rest as query
+    parameters (sources comma-separated)."""
+    await _admin._authorise(request, x_admin_key)
+    _art_media_type(media_type)
+    _check_tmdb_id(tmdb_id)
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > art_overrides.MAX_CUSTOM_BYTES:
+        raise HTTPException(status_code=413, detail="The image is too large")
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > art_overrides.MAX_CUSTOM_BYTES:
+            raise HTTPException(status_code=413, detail="The image is too large")
+        chunks.append(chunk)
+    path = await _art_store(b"".join(chunks), slot)
+    return _art_set({
+        "media_type": media_type, "tmdb_id": tmdb_id, "slot": slot, "language": language,
+        "sources": [x for x in sources.split(",") if x], "title": title,
+    }, path)
+
+
+@app.get("/custom-art/{name}")
+async def custom_art(name: str):
+    """An operator's pasted or uploaded image, for the dashboard's
+    thumbnails.  Names are content hashes, so it never changes."""
+    path = art_overrides.CUSTOM_PREFIX + name
+    data = await asyncio.to_thread(art_overrides.custom_art_bytes, path)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(
+        content=data, media_type="image/png" if name.endswith(".png") else "image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable",
+                 "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.delete("/admin/api/art/override")
+async def admin_art_clear(request: Request, media_type: str, tmdb_id: str,
+                          slot: str | None = None, language: str | None = None,
+                          x_admin_key: str = Header(default="")):
+    """Without slot, every override for the title; with slot and no
+    language, that slot's; with both, the one."""
+    await _admin._authorise(request, x_admin_key)
+    media_type = _art_media_type(media_type)
+    _check_tmdb_id(tmdb_id)
+    if slot is not None and slot not in art_overrides.SLOTS:
+        raise HTTPException(status_code=400, detail="bad slot")
+    try:
+        removed = art_overrides.clear_override(media_type, tmdb_id, slot, language)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _admin._json({"removed": removed})
+
+
+# ---------------------------------------------------------------------------
+# Sash lists: the notable studios, directors and cast behind those sashes,
+# edited from the dashboard instead of by hand in discovery_overrides.json.
+# ---------------------------------------------------------------------------
+
+_SASH_SECTIONS = discovery.SECTIONS
+# (section, name) -> the TMDB entity the editor shows beside a list entry.
+# Per process and unbounded in principle, but it only ever holds names that
+# were on a list or looked up by the operator.
+_sash_lookup_cache: dict[tuple[str, str], dict] = {}
+_SASH_LOOKUP_MAX = 150
+
+
+def _sash_section(value: str) -> str:
+    if value not in _SASH_SECTIONS:
+        raise HTTPException(status_code=400, detail="section must be studios, directors or cast")
+    return value
+
+
+def _sash_person_item(r: dict) -> dict:
+    known = [k.get("title") or k.get("name") or "" for k in (r.get("known_for") or [])]
+    return {
+        "id": r.get("id"),
+        "name": r.get("name") or "",
+        "thumb": f"{_TMDB_IMG}/w185{r['profile_path']}" if r.get("profile_path") else None,
+        "department": r.get("known_for_department") or "",
+        "known_for": [k for k in known if k][:3],
+        "popularity": round(float(r.get("popularity") or 0), 1),
+    }
+
+
+def _sash_company_item(r: dict) -> dict:
+    return {
+        "id": r.get("id"),
+        "name": r.get("name") or "",
+        "thumb": f"{_TMDB_IMG}/w185{r['logo_path']}" if r.get("logo_path") else None,
+        "country": r.get("origin_country") or "",
+    }
+
+
+async def _sash_tmdb_search(section: str, q: str) -> list[dict]:
+    _, key = _art_client_and_key()
+    kind = "company" if section == "studios" else "person"
+    resp = await _proxy_tmdb_get(
+        f"https://api.themoviedb.org/3/search/{kind}",
+        {"api_key": key, "query": q, "include_adult": "false", "page": "1"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"TMDB search returned {resp.status_code}")
+    results = resp.json().get("results") or []
+    if kind == "company":
+        # Logo'd companies first: TMDB keeps many stub entries under a
+        # famous name, and the one with a logo is nearly always the one
+        # credited.  Otherwise TMDB's order.
+        items = [_sash_company_item(r) for r in results]
+        return sorted(items, key=lambda i: i["thumb"] is None)
+    items = [_sash_person_item(r) for r in results]
+    want = "Directing" if section == "directors" else "Acting"
+    return sorted(items, key=lambda i: i["department"] != want)
+
+
+@app.get("/admin/api/sash-lists")
+async def admin_sash_lists(request: Request, x_admin_key: str = Header(default="")):
+    await _admin._authorise(request, x_admin_key)
+    return _admin._json({
+        "sections": discovery.current_lists(),
+        "path": discovery.override_path(),
+        "writable": discovery.override_writable(),
+        "max_label": discovery.MAX_LABEL_LENGTH,
+        "tmdb": bool(_cfg.SERVER_TMDB_KEY),
+    })
+
+
+@app.put("/admin/api/sash-lists")
+async def admin_sash_lists_save(request: Request, x_admin_key: str = Header(default="")):
+    """Body: {"changes": {section: [{"name", "label"}, ...] | null}}.  A list
+    replaces that section; null returns it to the built-in list."""
+    global _render_assets_signature
+    await _admin._authorise(request, x_admin_key)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    changes = body.get("changes") if isinstance(body, dict) else None
+    if not isinstance(changes, dict) or not changes:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+    parsed: dict[str, dict[str, str] | None] = {}
+    for section, entries in changes.items():
+        _sash_section(section)
+        try:
+            parsed[section] = None if entries is None else discovery.validate_entries(entries)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"{section}: {exc}")
+    if not discovery.override_writable():
+        raise HTTPException(status_code=500, detail=f"{discovery.override_path()} is not writable")
+    try:
+        discovery.save_sections(parsed)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write the lists: {exc}")
+    _render_assets_signature = _compute_render_assets_signature()
+    logger.info(f"Admin: sash lists saved ({', '.join(sorted(parsed))})")
+    return _admin._json({"sections": discovery.current_lists()})
+
+
+@app.get("/admin/api/sash-lists/search")
+async def admin_sash_search(request: Request, section: str, q: str = "",
+                            x_admin_key: str = Header(default="")):
+    await _admin._authorise(request, x_admin_key)
+    section = _sash_section(section)
+    q = q.strip()
+    if not q or len(q) > 200:
+        raise HTTPException(status_code=400, detail="Query missing or too long")
+    return _admin._json({"results": await _sash_tmdb_search(section, q)})
+
+
+@app.post("/admin/api/sash-lists/lookup")
+async def admin_sash_lookup(request: Request, x_admin_key: str = Header(default="")):
+    """Body: {"section", "names": [...]}.  The TMDB entity each name matches,
+    for the list's thumbnails — and, since the lists match credits by exact
+    name, whether TMDB has anyone by that exact name at all."""
+    await _admin._authorise(request, x_admin_key)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    section = _sash_section(str((body or {}).get("section") or ""))
+    names = (body or {}).get("names")
+    if not isinstance(names, list) or len(names) > _SASH_LOOKUP_MAX:
+        raise HTTPException(status_code=400, detail=f"names must be a list of at most {_SASH_LOOKUP_MAX}")
+    names = [str(n)[:discovery.MAX_NAME_LENGTH] for n in names if str(n).strip()]
+    sem = asyncio.Semaphore(6)
+
+    async def one(name: str) -> None:
+        if (section, name) in _sash_lookup_cache:
+            return
+        async with sem:
+            try:
+                results = await _sash_tmdb_search(section, name)
+            except HTTPException:
+                return
+        exact = [r for r in results if r["name"] == name]
+        pick = (exact or results or [None])[0]
+        _sash_lookup_cache[(section, name)] = {
+            "exact": bool(exact),
+            "match": pick,
+        }
+
+    await asyncio.gather(*(one(n) for n in dict.fromkeys(names)))
+    return _admin._json({
+        "found": {n: _sash_lookup_cache[(section, n)] for n in names if (section, n) in _sash_lookup_cache},
+    })
 
 
 # TMDB genre name → id, used only by the debug canvas preview below.
@@ -7383,11 +7895,23 @@ async def get_logo(
     effective_imdb_id = imdb_id or tmdb_data.get("imdb_id") or None
     original_language = tmdb_data.get("original_language")
 
-    logo_image = await fetch_logo(
-        client, logos, effective_lang,
-        imdb_id=effective_imdb_id,
-        original_language=original_language,
+    logo_image = None
+    _logo_override = art_overrides.pick_logo(
+        None if use_cinemeta else art_overrides.for_title(media_type, tmdb_id),
+        logo_language_steps(effective_lang, original_language, "native_original"),
+        lambda step: logo_step_available(logos, step),
     )
+    if _logo_override is not None:
+        try:
+            logo_image = await fetch_logo_image(client, _logo_override.path)
+        except Exception as exc:
+            logger.warning(f"Operator logo for {tmdb_id} failed ({exc}) — using the usual pick")
+    if logo_image is None:
+        logo_image = await fetch_logo(
+            client, logos, effective_lang,
+            imdb_id=effective_imdb_id,
+            original_language=original_language,
+        )
 
     if logo_image is None:
         raise HTTPException(status_code=404, detail="No logo available")
@@ -7891,6 +8415,10 @@ async def get_poster(
             else f"{canonical_id}:{tmdb_id}:{type}:{_params_hash}"
         )
         _cached_entry = None
+        # Before the in-memory lookup: an operator's art change made on another
+        # worker drops this worker's copies of that title here, not only when
+        # something renders.  A clock check, and one row every few seconds.
+        art_overrides.refresh()
         if not _force_refresh:
             _cached_entry = get_cached_final_poster_l1(final_cache_key) or await _db_call(
                 get_cached_final_poster_entry, final_cache_key
@@ -8471,6 +8999,53 @@ async def get_poster(
                 logger.info(f"fanart.tv poster for {tmdb_id}: {_fa_url}"
                             f"{' (original art)' if _use_original_art else ''}")
 
+        # TVDB poster source: its best no-language poster (textless in
+        # practice), treated like a TMDB textless one; or under original art
+        # its best poster in the request's language order, served as-is.
+        # TMDB's pick stands when TVDB has none.
+        if (rcfg.poster_source == "tvdb" and not using_anime_art
+                and not use_cinemeta):
+            _tv_url = await tvdb.tvdb_poster_url(
+                client, media_type=type, tmdb_id=tmdb_id, imdb_id=effective_imdb_id,
+                languages=_poster_language_order if rcfg.use_original_art else None,
+                random_top=rcfg.poster_pick == "random",
+            )
+            if _tv_url:
+                poster_path       = _tv_url
+                _use_backdrop     = False
+                _use_original_art = rcfg.use_original_art
+                is_textless       = not _use_original_art
+                logger.info(f"TVDB poster for {tmdb_id}: {_tv_url}"
+                            f"{' (original art)' if _use_original_art else ''}")
+
+        # The operator's chosen art for this title (dashboard → Artwork) beats
+        # every pick above — default, random, backdrop fallback, fanart.tv,
+        # TVDB — for the poster sources the operator ticked.  A textless pick
+        # is vouched for, so it skips the burned-in-text scan; an original-art
+        # pick is served as-is.  Landscape draws from backdrops and anime
+        # provider covers aren't from any of the three sources, so neither is
+        # touched.  See art_overrides for the language rules.
+        _title_art = art_overrides.for_title(type, tmdb_id) if has_tmdb_id else None
+        _art_override = None
+        if _title_art and not _is_landscape:
+            _art_override = art_overrides.pick_poster(
+                _title_art,
+                original=rcfg.use_original_art,
+                source=(None if (using_anime_art or use_cinemeta)
+                        else "tvdb" if rcfg.poster_source == "tvdb"
+                        else "fanart" if _fanart_wanted
+                        else "tmdb"),
+                language_order=_poster_language_order,
+                has_language=lambda language: bool(_plangs.get(language)),
+            )
+        if _art_override is not None:
+            poster_path       = _art_override.path
+            _use_backdrop     = False
+            _use_original_art = rcfg.use_original_art
+            is_textless       = not _use_original_art
+            logger.info(f"Operator art for {tmdb_id}: {poster_path}"
+                        f"{' (original art)' if _use_original_art else ''}")
+
         # Anime providers ship exactly one cover image per title and it
         # essentially always has the title logotype baked into the art, so it is
         # served as-is under the same rules as original-art mode: no logo
@@ -8655,6 +9230,21 @@ async def get_poster(
                 # already in the art; don't double it with our logo.
                 is_textless = bool(backdrop_path)
             _use_backdrop = False
+            # The operator's chosen landscape art (dashboard → Artwork), by the
+            # same language walk as original-art posters.  Rows cached before
+            # the text-backdrop languages were kept don't know them, so there
+            # the override applies at the first language that has one.
+            _bd_langs = (tmdb_data.get("poster_pools") or {}).get("backdrop_langs")
+            _ls_override = art_overrides.pick_landscape(
+                _title_art,
+                original=rcfg.landscape_art == "original",
+                language_order=_poster_language_order,
+                has_language=lambda language: bool(_bd_langs) and language in _bd_langs,
+            )
+            if _ls_override is not None:
+                _ls_path    = _ls_override.path
+                is_textless = rcfg.landscape_art != "original"
+                logger.info(f"Operator landscape art for {tmdb_id}: {_ls_path}")
             if _ls_path is None:
                 # Metahub's background is a textless backdrop of the same class
                 # as TMDB's, so it is a straight substitute before the canvas.
@@ -8669,6 +9259,9 @@ async def get_poster(
                 is_textless = True
             else:
                 _image_coro = fetch_landscape_image(client, tmdb_id, _ls_path)
+        elif _art_override is not None and _art_override.crop is not None:
+            # The operator's own framing of a backdrop (or any wide image).
+            _image_coro = fetch_cropped_art(client, tmdb_id, poster_path, _art_override.crop)
         elif _use_backdrop:
             # Text-aware backdrop cropping also invokes PP-OCR, so apply the
             # same foreground vote gate used by the final burned-in-text scan.
@@ -8802,9 +9395,10 @@ async def get_poster(
                         tmdb_id=tmdb_id, avoid_text=True,
                     )
                 # Third rescue tier (opt-in, TVDB_USE_POSTERS): a TVDB poster.
-                # These usually have title text baked in, so it's only used when
-                # text detection confirms it's clean — otherwise we keep the
-                # official poster.  Same low-vote gate.
+                # Only a no-language one — TVDB's language-tagged posters nearly
+                # all carry the title, often in a style the detector misses —
+                # and only when text detection agrees it's clean; otherwise we
+                # keep the official poster.  Same low-vote gate.
                 _tvdb_ps = None
                 _tvdb_ps_id = None
                 if (_tvdb_bg is None and _cfg.TVDB_USE_POSTERS and tvdb.tvdb_enabled()
@@ -8813,6 +9407,7 @@ async def get_poster(
                     _tvdb_ps, _tvdb_ps_id = await tvdb.tvdb_poster(
                         client, media_type=type, language=rcfg.logo_language,
                         imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                        textless_only=True,
                     )
                 if _tvdb_bg is not None and await _tvdb_is_clean(_tvdb_bg, _tvdb_bg_id):
                     is_textless = True
@@ -8840,6 +9435,7 @@ async def get_poster(
             and is_textless
             and not is_no_poster
             and not _backdrop_rescued
+            and _art_override is None
             # Anime art is deliberately composited with a logo regardless of any
             # Japanese corner text, so the scan would only burn an OCR pass to
             # produce an inconsistent result. See the is_textless assignment.
@@ -8919,6 +9515,23 @@ async def get_poster(
         _tvdb_logo_pri = _cfg.TVDB_LOGO_PRIORITY if tvdb.tvdb_enabled() else 3
 
         async def _resolve_logo():
+            _logo_override = art_overrides.pick_logo(
+                _title_art,
+                logo_language_steps(
+                    rcfg.logo_language, tmdb_data.get("original_language"),
+                    rcfg.logo_priority, _effective_secondary,
+                ),
+                lambda step: logo_step_available(logos, step),
+            )
+            if _logo_override is not None:
+                try:
+                    _chosen = await fetch_logo_image(client, _logo_override.path)
+                    if _chosen is not None:
+                        logger.info(f"Operator logo for {tmdb_id}: {_logo_override.path}")
+                        return _chosen
+                except Exception as exc:
+                    logger.warning(f"Operator logo for {tmdb_id} failed ({exc}) — using the usual pick")
+
             async def _tmdb(use_metahub):
                 return await fetch_logo(
                     client, logos, rcfg.logo_language,
@@ -9309,7 +9922,14 @@ async def get_poster(
                     or (_scheduled_digital - datetime.now().date()).days <= _LEAK_LEAD_DAYS)
         _status_sash = any(s in rcfg.sash_priority for s in _rs_slots)
         _status_grey = rcfg.cinema_greyscale and rcfg.cinema_greyscale_without_sash
-        if _status_sash or _status_grey or rcfg.hide_unreleased_rating:
+        # The popcorn badge: a film still in cinemas (or not out at all),
+        # shown without a sash — or beside a different one.
+        _cinema_badge = (
+            type not in ("tv", "series")
+            and (rcfg.landscape_graphic_badges if _is_landscape else rcfg.badge_display_mode == 7)
+            and any("cinema" in g.slots for g in graphic_badges.cfg_groups(rcfg))
+        )
+        if _status_sash or _status_grey or _cinema_badge or rcfg.hide_unreleased_rating:
             # Resolved for every title regardless of age.  There used to be an
             # age gate here that skipped the lookup for anything older than a
             # configurable limit, but it silently blanked the status on older
@@ -9377,6 +9997,19 @@ async def get_poster(
             # skipped (and lower-priority sashes can surface) for released titles.
             if rcfg.release_status_cinema_only and _release_status not in ("Cinema", "Production"):
                 _release_status = None
+
+        # Also read before that drop, as the badge never needs a status slot.
+        # Its colour counts down to the film's first home release (digital or
+        # disc) — the day the status, and the badge, move on.
+        _cinema_run: graphic_badges.CinemaRun | None = None
+        if _cinema_badge and _release_status in ("Cinema", "Production"):
+            _home_rows = ((get_cached_movie_release_info(f"movie_{tmdb_id}") or {}) if has_tmdb_id else {},
+                          mdblist_release_dates(effective_imdb_id, type) or {})
+            _home = [d for d in (_parse_tmdb_date(r.get(k)) for r in _home_rows
+                                 for k in ("digital_date", "physical_date", "released_digital"))
+                     if d is not None and d >= datetime.now().date()]
+            _cinema_run = graphic_badges.CinemaRun(
+                _release_status, (min(_home) - datetime.now().date()).days if _home else None)
 
         # Read before the status is dropped below, which it is when only
         # hide_unreleased_rating asked for it: the status also drives the
@@ -9510,6 +10143,8 @@ async def get_poster(
                 "matched_directors": discovery_meta.matched_directors,
                 "matched_cast":      discovery_meta.matched_cast,
                 "release_status":    discovery_meta.release_status,
+                "cinema_badge":      ({"status": _cinema_run.status, "days_to_home": _cinema_run.days_to_home}
+                                      if _cinema_run else None),
                 "upcoming_release_date": discovery_meta.upcoming_release_date,
                 "upcoming_release_window": discovery_meta.upcoming_release_window,
                 "sash_priority":     _sash_priority,
@@ -9709,6 +10344,7 @@ async def get_poster(
                 await asyncio.gather(graphic_badges.ensure_logo(client, _network),
                                      graphic_badges.ensure_logo(client, _studio))
                 _bp_args["badge_logos"] = (_network, _studio)
+            _bp_args["cinema_run"] = _cinema_run
 
         # Rating badges: the per-provider scores behind them, and the marks of
         # the providers this title has a score from (each fetched once per

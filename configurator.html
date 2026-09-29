@@ -2238,7 +2238,7 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
       </button>
       <!-- Shown only when the operator turns on SHOW_ADMIN_LINK and the
            dashboard is enabled (serverCaps.admin_link). -->
-      <a class="header-admin" id="header-admin" href="/admin" target="_blank" rel="noopener" hidden>
+      <a class="header-admin" id="header-admin" href="/admin" hidden>
         <svg width="14" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z"/>
         </svg>
@@ -3112,11 +3112,12 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
             </div>
             <!-- Poster source and pick; each shown only when the operator allows it -->
             <div class="field portrait-only" id="poster-source-field" hidden>
-              <label class="field-label" data-tip="Where posters come from. fanart.tv art is community-uploaded, so it's often different from TMDB's: textless posters normally, or posters in your logo language with Original Art on. Titles without fanart.tv art keep their TMDB poster. The anime option uses fanart.tv only for anime (Japanese animation) and TMDB for everything else.">Poster Source</label>
+              <label class="field-label" data-tip="Where posters come from. Fanart art is community-uploaded, so it's often different from TMDB's: textless posters normally, or posters in your logo language with Original Art on. Titles without Fanart art keep their TMDB poster. The anime option uses Fanart only for anime (Japanese animation) and TMDB for everything else. TVDB posters with no language are textless; with Original Art on, TVDB gives a poster in your logo language. Titles TVDB has nothing for keep their TMDB poster.">Poster Source</label>
               <select id="cfg-poster-source" onchange="build(); queuePreviewReload()">
                 <option value="tmdb" selected>TMDB</option>
-                <option value="fanart">fanart.tv</option>
-                <option value="fanart_anime">TMDB, with fanart.tv for anime</option>
+                <option value="fanart">Fanart</option>
+                <option value="fanart_anime">TMDB, with Fanart for anime</option>
+                <option value="tvdb">TVDB</option>
               </select>
             </div>
             <div class="field portrait-only" id="poster-pick-field" hidden>
@@ -3554,7 +3555,7 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
               </div>
             </div>
 
-            <!-- Graphic Badges (mode 7): three groups, each an anchor, a max and the
+            <!-- Graphic Badges (mode 7): four groups, each an anchor, a max and the
                  badges assigned to it.  The hidden inputs hold each group's URL
                  spelling and are the source of truth; the list below edits them. -->
             <div id="badge-groups-fields" class="cfg-sep" style="display:none">
@@ -3563,6 +3564,7 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
               <input type="hidden" id="cfg-badge-group1" value="chip:4:video,audio,res,cert" data-default="chip:4:video,audio,res,cert">
               <input type="hidden" id="cfg-badge-group2" value="" data-default="">
               <input type="hidden" id="cfg-badge-group3" value="" data-default="">
+              <input type="hidden" id="cfg-badge-group4" value="" data-default="">
               <div class="field">
                 <label class="field-label" data-tip="Beside Chip is the top corner the notch or sash leaves free. Above/Below Logo centre the group on the title logo, however tall it is, moving further off if the rating is in the way. A group whose corner is taken slides away from the edge until it fits; badges that still don't fit drop from the end of the list. Custom puts it exactly where you set it, for dodging a badge your client draws; Align picks which edge of the row sits at X.">Group 1</label>
                 <div class="gb-group-row">
@@ -3642,11 +3644,47 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
                 </div>
               </div>
               <div class="field">
+                <label class="field-label">Group 4</label>
+                <div class="gb-group-row">
+                  <select id="gb-anchor-4" onchange="gbFromControls()">
+                  <option value="chip">Beside Chip</option>
+                  <option value="tl">Top Left</option>
+                  <option value="tr">Top Right</option>
+                  <option value="bl">Bottom Left</option>
+                  <option value="br" selected>Bottom Right</option>
+                  <option value="above_logo">Above Logo</option>
+                  <option value="below_logo">Below Logo</option>
+                  <option value="custom">Custom</option>
+                  </select>
+                  <select id="gb-max-4" title="Most badges shown at once" onchange="gbFromControls()"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select>
+                </div>
+                <div class="gb-xy" id="gb-xy-4" style="display:none">
+                  <div class="range-row"><span class="gb-axis">X</span>
+                    <input type="range" id="gb-x-4" min="0" max="1" step="0.005" value="0.05" oninput="updateRange(this,'rng-gbx4'); gbFromControls()">
+                    <span class="range-val" id="rng-gbx4">0.05</span></div>
+                  <div class="range-row"><span class="gb-axis">Y</span>
+                    <input type="range" id="gb-y-4" min="0" max="1" step="0.005" value="0.05" oninput="updateRange(this,'rng-gby4'); gbFromControls()">
+                    <span class="range-val" id="rng-gby4">0.05</span></div>
+                  <div class="gb-align-row"><span class="gb-align-label" data-tip="Which part of the row sits at X. Left: the row starts there and grows rightwards. Right: it ends there and grows leftwards. That edge stays put however many badges a title has.">Align</span>
+                    <div class="gb-seg" id="gb-align-4" data-value="l"></div></div>
+                </div>
+              </div>
+              <div class="field">
                 <div class="gb-list-label">
                   <label class="field-label" data-tip="Order sets the order across each row, and which badges stay when there is no room for all of them: the last in a group drops first.">Badges</label>
                   <span class="gb-col">Group</span>
                 </div>
                 <div class="sash-list" id="gb-badge-list"></div>
+              </div>
+              <div class="field" id="gb-cinema-style-field" style="display:none">
+                <label class="field-label" data-tip="The popcorn shows on a film that is still in cinemas, or not out yet, without taking the sash. By Streaming Date turns it green inside a week of its digital release, amber inside two weeks, and red further off or when no date is known.">Popcorn Colour</label>
+                <select id="cfg-badge-cinema-style" onchange="build(); queuePreviewReload()">
+                  <option value="timing" selected>By Streaming Date</option>
+                  <option value="red">Red</option>
+                  <option value="black">Black</option>
+                  <option value="white">White</option>
+                  <option value="frosted">Frosted</option>
+                </select>
               </div>
             </div>
 
@@ -3698,6 +3736,22 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
                   <div class="range-row">
                     <input type="range" id="gb-gap-3" min="0" max="0.08" step="0.002" value="0.028" oninput="updateRange(this,'rng-gbgap3'); gbFromControls()">
                     <span class="range-val" id="rng-gbgap3">0.028</span>
+                  </div>
+                </div>
+              </div>
+              <div class="gb-layout-group" id="gb-layout-4" style="display:none">
+                <div class="field">
+                  <label class="field-label">Group 4 Size</label>
+                  <div class="range-row">
+                    <input type="range" id="gb-size-4" min="10" max="60" step="1" value="22" oninput="updateRange(this,'rng-gbsz4'); gbFromControls()">
+                    <span class="range-val" id="rng-gbsz4">22</span>
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="field-label" data-tip="Space between this group's badges. The gap a group keeps from the notch, rating and other groups doesn't change.">Group 4 Spacing</label>
+                  <div class="range-row">
+                    <input type="range" id="gb-gap-4" min="0" max="0.08" step="0.002" value="0.028" oninput="updateRange(this,'rng-gbgap4'); gbFromControls()">
+                    <span class="range-val" id="rng-gbgap4">0.028</span>
                   </div>
                 </div>
               </div>
@@ -3835,6 +3889,13 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
                  saved settings and Reset like every other tog- control; the
                  button only mirrors it. -->
             <input type="checkbox" id="tog-landscape" hidden>
+            <!-- Into the admin dashboard's artwork editor for this title.  Only
+                 when the operator turned it on there (off by default). -->
+            <a class="icon-btn" id="artwork-edit-link" hidden
+               aria-label="Edit this title's artwork in the admin dashboard"
+               data-tip="Choose this title's poster, logo and landscape art for everyone, in the admin dashboard.">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="13" height="18" rx="2"/><path d="M3 15l4-4 4 4"/><path d="M14.5 13.5l6-6a1.4 1.4 0 0 0-2-2l-6 6-.8 2.8z"/></svg>
+            </a>
             <button type="button" class="icon-btn" id="shape-toggle"
                     aria-pressed="false"
                     aria-label="Switch the preview between portrait and landscape"
@@ -4448,9 +4509,18 @@ async function fetchServerCaps() {
       queuePreviewReload();
     }
     updateKeyBadges();
+    updateExternalLink();   // the artwork edit link waits on the caps
     updateImdbSourceAvailability();
     updateResolutionAvailability();
-    document.getElementById('poster-source-field').hidden = !serverCaps.fanart_posters;
+    document.getElementById('poster-source-field').hidden = !(serverCaps.fanart_posters || serverCaps.tvdb_posters);
+    // Only the sources this instance offers; a restored choice it doesn't
+    // offer falls back to TMDB.
+    for (const opt of document.querySelectorAll('#cfg-poster-source option')) {
+      opt.hidden = opt.value === 'tvdb' ? !serverCaps.tvdb_posters
+        : opt.value.startsWith('fanart') ? !serverCaps.fanart_posters : false;
+    }
+    const _srcSel = document.getElementById('cfg-poster-source');
+    if (_srcSel.selectedOptions[0] && _srcSel.selectedOptions[0].hidden) _srcSel.value = 'tmdb';
     document.getElementById('poster-pick-field').hidden = !serverCaps.random_posters;
     // Restored before the caps answered, so the URL left them out.
     if (vEl('cfg-poster-source') !== 'tmdb' || vEl('cfg-poster-pick') !== 'top') build();
@@ -4587,6 +4657,10 @@ function badgeUsesQuality(mode = parseInt(vEl('cfg-badge-display-mode')),
     .some(id => ['video', 'audio', 'res'].includes(id)));
 }
 
+function gbHasSlot(raw, id) {
+  return (gbParse(raw)?.slots || []).includes(id);
+}
+
 function updateScraperHint() {
   const qualityMode = badgeUsesQuality();
   document.getElementById('wait-quality-field').style.display = qualityMode ? '' : 'none';
@@ -4628,15 +4702,15 @@ const BADGE_MODE_TIPS = {
   4: 'A medal-coloured marker based on stream quality.',
   5: 'Minimalist text badge: resolution · visual tag, pip coloured by source. Needs both resolution and source; visual tag defaults to SDR if absent.',
   6: 'A small corner bookmark coloured by the same quality tier as Quality Notch. Clients render posters at different scales, so Badge Size usually needs adjusting to suit yours.',
-  7: 'Dolby Vision, Atmos, DTS:X, HDR and resolution marks and the US certificate, in up to three groups you place below. Pairs well with the Left/Right notch position.',
+  7: 'Dolby Vision, Atmos, DTS:X, HDR and resolution marks and the US certificate, in up to four groups you place below. Pairs well with the Left/Right notch position.',
 };
 
 // ── Graphic badge groups ────────────────────────────────────────────────────
-// Hidden inputs cfg-badge-group1..3 hold "anchor:max:slot,slot"
+// Hidden inputs cfg-badge-group1..4 hold "anchor:max:slot,slot"
 // (graphic_badges.parse_group).  The list shows every badge once, in one order
 // shared by all groups, with the group it belongs to; a badge in none is Off.
-const GB_GROUPS = [1, 2, 3];
-const GB_DEFAULT_ANCHOR = { 1: 'chip', 2: 'bl', 3: 'tl' };
+const GB_GROUPS = [1, 2, 3, 4];
+const GB_DEFAULT_ANCHOR = { 1: 'chip', 2: 'bl', 3: 'tl', 4: 'br' };
 const GB_SLOTS = [
   { id: 'video', label: 'Dolby Vision / HDR' },
   { id: 'audio', label: 'Atmos / DTS:X' },
@@ -4644,6 +4718,7 @@ const GB_SLOTS = [
   { id: 'cert',  label: 'Certificate' },
   { id: 'network', label: 'Network' },
   { id: 'studio',  label: 'Studio' },
+  { id: 'cinema',  label: 'In Cinemas (Popcorn)' },
 ];
 const GB_ANCHORS = ['chip', 'tl', 'tr', 'bl', 'br', 'above_logo', 'below_logo'];
 const GB_SIZE = 22, GB_SPACING = 0.028;   // graphic_badges.DEFAULT_SIZE / DEFAULT_SPACING
@@ -4771,6 +4846,7 @@ function gbRender() {
     seg.innerHTML = [['l', 'Left'], ['c', 'Centre'], ['r', 'Right']].map(([v, t]) =>
       `<span class="${v === grp.align ? 'active' : ''}" onclick="gbSetAlign(${g}, '${v}')">${t}</span>`).join('');
   });
+  document.getElementById('gb-cinema-style-field').style.display = st.assign.cinema ? '' : 'none';
   list.innerHTML = '';
   st.order.forEach((id, idx) => {
     const slot = GB_SLOTS.find(s => s.id === id);
@@ -5987,6 +6063,12 @@ function updateExternalLink() {
 
   btn.hidden = !(imdb || tmdb);
   if (btn.hidden) closeExternalMenu();
+
+  const edit = document.getElementById('artwork-edit-link');
+  if (edit) {
+    edit.hidden = !(serverCaps.artwork_edit_link && tmdb);
+    if (!edit.hidden) edit.href = `/admin#artwork/${type}/${encodeURIComponent(tmdb)}`;
+  }
 }
 
 function closeExternalMenu() {
@@ -6405,7 +6487,7 @@ function buildBaseParams({ usePlaceholders = false, domainOverride = null, full 
   if (emitAll) {
     params.set('use_original_art',    c('tog-original-art') ? 'true' : 'false');
     params.set('original_art_source', vEl('cfg-original-art-source') || 'primary');
-    if (serverCaps.fanart_posters && vEl('cfg-poster-source') !== 'tmdb') params.set('poster_source', vEl('cfg-poster-source'));
+    if ((serverCaps.fanart_posters || serverCaps.tvdb_posters) && vEl('cfg-poster-source') !== 'tmdb') params.set('poster_source', vEl('cfg-poster-source'));
     if (serverCaps.random_posters && vEl('cfg-poster-pick') !== 'top') params.set('poster_pick', vEl('cfg-poster-pick'));
   }
   params.set('logo_language',         logoLanguage);
@@ -6533,6 +6615,12 @@ function buildBaseParams({ usePlaceholders = false, domainOverride = null, full 
   const _qualityShown = (emitAll && badgeUsesQuality(badgeMode, pGroups))
     || (emitLandscape && lBadgeMode === 7 && badgeUsesQuality(7, lGroups));
   if (_qualityShown && !params.has('badge_min_score')) params.set('badge_min_score', ni('cfg-badge-min-score'));
+  // The popcorn's colour is one setting for both shapes, like the minimum.
+  const _cinemaShown = (emitAll && badgeMode === 7 && pGroups.some(g => gbHasSlot(g, 'cinema')))
+    || (emitLandscape && lBadgeMode === 7 && lGroups.some(g => gbHasSlot(g, 'cinema')));
+  if (_cinemaShown && vEl('cfg-badge-cinema-style') !== 'timing') {
+    params.set('badge_cinema_style', vEl('cfg-badge-cinema-style'));
+  }
   if (_qualityShown && c('tog-wait-quality')) {
     params.set('wait_for_quality', 'true');
     if (c('tog-greyscale-noquality')) params.set('greyscale_no_quality', 'true');
@@ -7589,6 +7677,7 @@ const _SHARED_PARAM = {
   'cfg-badge-group1':          'badge_group1',
   'cfg-badge-group2':          'badge_group2',
   'cfg-badge-group3':          'badge_group3',
+  'cfg-badge-group4':          'badge_group4',
 };
 const _SHARED_NO_FALLBACK = new Set(['badge_display_mode']);
 const _SHAPE_SHARED = Object.keys(_SHARED_PARAM);
@@ -7598,7 +7687,7 @@ const _LANDSCAPE_SHARED_DEFAULTS = {
   'cfg-vignette-sat': '2.00', 'cfg-vignette-light': '1.30', 'cfg-vignette-blur': '1.00',
   'tog-hide-genre': false, 'tog-hide-year': false, 'tog-hide-rating': false, 'tog-textless': false, 'cfg-sash-mode': 'sash',
   'cfg-badge-display-mode': '0', 'cfg-badge-group1': 'chip:4:video,audio,res,cert',
-  'cfg-badge-group2': '', 'cfg-badge-group3': '',
+  'cfg-badge-group2': '', 'cfg-badge-group3': '', 'cfg-badge-group4': '',
 };
 const SHAPE_STASH_KEY = 'postersplus_shape_stash';
 let _shapeStash = { portrait: null, landscape: null };   // null = that shape's defaults
@@ -8784,6 +8873,8 @@ function importUrl(urlStr, { silent = false, settingsOnly = false, preserveClien
   if (p.has('badge_group1')) _setEl('cfg-badge-group1', p.get('badge_group1'));
   if (p.has('badge_group2')) _setEl('cfg-badge-group2', p.get('badge_group2'));
   if (p.has('badge_group3')) _setEl('cfg-badge-group3', p.get('badge_group3'));
+  if (p.has('badge_group4')) _setEl('cfg-badge-group4', p.get('badge_group4'));
+  _setEl('cfg-badge-cinema-style', p.get('badge_cinema_style') || 'timing');
   gbRender();
   // Seed the mode's defaults BEFORE applying the saved values, so a URL that
   // omits badge_height (/server-caps not answered yet) still gets a size that
